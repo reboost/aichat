@@ -411,6 +411,14 @@ pub fn openai_extract_chat_completions(data: &Value) -> Result<ChatCompletionsOu
     Ok(output)
 }
 
+fn normalize_function_id(value: &str) -> Option<String> {
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
 #[cfg(test)]
 mod gemini_extra_content_tests {
     use super::*;
@@ -459,10 +467,3 @@ mod gemini_extra_content_tests {
     }
 }
 
-fn normalize_function_id(value: &str) -> Option<String> {
-    if value.is_empty() {
-        None
-    } else {
-        Some(value.to_string())
-    }
-}
