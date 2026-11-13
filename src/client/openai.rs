@@ -149,13 +149,8 @@ pub async fn openai_chat_completions_streaming(
             }
             handler.text(text)?;
         }
-        if let Some(extra_content) =
-            data["choices"][0]["delta"]["tool_calls"][0].get("extra_content")
-        {
-            if !extra_content.is_null() {
-                function_extra_content = Some(extra_content.clone());
-            }
-        }
+        let tool_call_delta = &data["choices"][0]["delta"]["tool_calls"][0];
+        let mut new_tool_call = false;
         if let (Some(function), index, id) = (
             data["choices"][0]["delta"]["tool_calls"][0]["function"].as_object(),
             data["choices"][0]["delta"]["tool_calls"][0]["index"].as_u64(),
@@ -187,7 +182,7 @@ pub async fn openai_chat_completions_streaming(
                 function_name.clear();
                 function_arguments.clear();
                 function_id.clear();
-                function_extra_content = None;
+                new_tool_call = true;
                 call_id = maybe_call_id;
             }
             if let Some(name) = function.get("name").and_then(|v| v.as_str()) {
@@ -204,6 +199,11 @@ pub async fn openai_chat_completions_streaming(
                 function_id = id.to_string();
             }
         }
+        openai_update_tool_call_extra_content(
+            tool_call_delta,
+            new_tool_call,
+            &mut function_extra_content,
+        );
         Ok(false)
     };
 
@@ -338,6 +338,19 @@ pub fn openai_build_chat_completions_body(data: ChatCompletionsData, model: &Mod
     body
 }
 
+fn openai_update_tool_call_extra_content(
+    delta: &Value,
+    is_new_call: bool,
+    extra_content: &mut Option<Value>,
+) {
+    if is_new_call {
+        *extra_content = None;
+    }
+    if let Some(value) = delta.get("extra_content").filter(|value| !value.is_null()) {
+        *extra_content = Some(value.clone());
+    }
+}
+
 fn openai_tool_call_to_value(call: &ToolCall) -> Value {
     let mut value = json!({
         "id": call.id,
@@ -423,6 +436,25 @@ fn normalize_function_id(value: &str) -> Option<String> {
 mod gemini_extra_content_tests {
     use super::*;
     use crate::function::ToolResult;
+
+    #[test]
+    fn preserves_thought_signature_on_first_streaming_tool_call_delta() {
+        let previous = json!({ "google": { "thought_signature": "previous" } });
+        let extra_content = json!({ "google": { "thought_signature": "signature-1" } });
+        let delta = json!({
+            "id": "call-1",
+            "index": 0,
+            "function": { "name": "probe", "arguments": "{}" },
+            "extra_content": extra_content
+        });
+        let mut captured = Some(previous);
+
+        openai_update_tool_call_extra_content(&delta, true, &mut captured);
+
+        let mut call = ToolCall::new("probe".into(), json!({}), Some("call-1".into()));
+        call.extra_content = captured;
+        assert_eq!(openai_tool_call_to_value(&call)["extra_content"], extra_content);
+    }
 
     #[test]
     fn preserves_gemini_thought_signature_across_openai_compatible_tool_loop() {
