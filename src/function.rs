@@ -138,6 +138,8 @@ pub struct ToolCall {
     pub name: String,
     pub arguments: Value,
     pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_content: Option<Value>,
 }
 
 type CallConfig = (String, String, Vec<String>, HashMap<String, String>);
@@ -167,6 +169,7 @@ impl ToolCall {
             name,
             arguments,
             id,
+            extra_content: None,
         }
     }
 

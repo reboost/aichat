@@ -215,11 +215,9 @@ pub async fn gemini_chat_completions_streaming(
                             handler.text("\n\n")?;
                         }
                         handler.text(text)?;
-                    } else if let (Some(name), Some(args)) = (
-                        part["functionCall"]["name"].as_str(),
-                        part["functionCall"]["args"].as_object(),
-                    ) {
-                        handler.tool_call(ToolCall::new(name.to_string(), json!(args), None))?;
+                    }
+                    if let Some(call) = gemini_tool_call_from_part(part) {
+                        handler.tool_call(call)?;
                     }
                 }
             } else if let Some("SAFETY") = data["promptFeedback"]["blockReason"]
@@ -234,6 +232,38 @@ pub async fn gemini_chat_completions_streaming(
         json_stream(res.bytes_stream(), handle).await?;
     }
     Ok(())
+}
+
+fn gemini_tool_call_from_part(part: &Value) -> Option<ToolCall> {
+    let function_call = &part["functionCall"];
+    let name = function_call["name"].as_str()?;
+    let args = function_call["args"].as_object()?;
+    let id = function_call["id"].as_str().map(str::to_string);
+    let mut call = ToolCall::new(name.to_string(), json!(args), id);
+    if let Some(signature) = part["thoughtSignature"].as_str() {
+        call.extra_content = Some(json!({
+            "google": { "thought_signature": signature }
+        }));
+    }
+    Some(call)
+}
+
+fn gemini_function_call_part(call: &ToolCall) -> Value {
+    let mut part = json!({
+        "functionCall": {
+            "name": call.name,
+            "args": call.arguments,
+        }
+    });
+    if let Some(id) = &call.id {
+        part["functionCall"]["id"] = json!(id);
+    }
+    if let Some(signature) = call.extra_content.as_ref()
+        .and_then(|v| v["google"]["thought_signature"].as_str())
+    {
+        part["thoughtSignature"] = json!(signature);
+    }
+    part
 }
 
 async fn embeddings(builder: RequestBuilder, _model: &Model) -> Result<EmbeddingsOutput> {
@@ -276,11 +306,8 @@ fn gemini_extract_chat_completions_text(data: &Value) -> Result<ChatCompletionsO
             if let Some(text) = part["text"].as_str() {
                 text_parts.push(text);
             }
-            if let (Some(name), Some(args)) = (
-                part["functionCall"]["name"].as_str(),
-                part["functionCall"]["args"].as_object(),
-            ) {
-                tool_calls.push(ToolCall::new(name.to_string(), json!(args), None));
+            if let Some(call) = gemini_tool_call_from_part(part) {
+                tool_calls.push(call);
             }
         }
     }
@@ -352,28 +379,29 @@ pub fn gemini_build_chat_completions_body(
                         vec![json!({ "role": role, "parts": parts })]
                     },
                     MessageContent::ToolCalls(MessageContentToolCalls { tool_results, .. }) => {
-                        let model_parts: Vec<Value> = tool_results.iter().map(|tool_result| {
-                            json!({
-                                "functionCall": {
-                                    "name": tool_result.call.name,
-                                    "args": tool_result.call.arguments,
-                                }
-                            })
-                        }).collect();
-                        let function_parts: Vec<Value> = tool_results.into_iter().map(|tool_result| {
-                            json!({
-                                "functionResponse": {
+                        let model_parts: Vec<Value> = tool_results
+                            .iter()
+                            .map(|tool_result| gemini_function_call_part(&tool_result.call))
+                            .collect();
+                        let function_parts: Vec<Value> = tool_results
+                            .iter()
+                            .map(|tool_result| {
+                                let mut response = json!({
                                     "name": tool_result.call.name,
                                     "response": {
                                         "name": tool_result.call.name,
                                         "content": tool_result.output,
                                     }
+                                });
+                                if let Some(id) = &tool_result.call.id {
+                                    response["id"] = json!(id);
                                 }
+                                json!({ "functionResponse": response })
                             })
-                        }).collect();
+                            .collect();
                         vec![
                             json!({ "role": "model", "parts": model_parts }),
-                            json!({ "role": "function", "parts": function_parts }),
+                            json!({ "role": "user", "parts": function_parts }),
                         ]
                     }
                 }
@@ -422,6 +450,71 @@ pub fn gemini_build_chat_completions_body(
     }
 
     Ok(body)
+}
+
+#[cfg(test)]
+mod gemini_function_call_tests {
+    use super::*;
+    use crate::function::ToolResult;
+
+    #[test]
+    fn extracts_gemini_function_call_id_and_thought_signature() {
+        let response = json!({
+            "candidates": [{
+                "content": { "parts": [{
+                    "functionCall": {
+                        "name": "probe",
+                        "args": { "value": 1 },
+                        "id": "call-1"
+                    },
+                    "thoughtSignature": "signature-1"
+                }] }
+            }]
+        });
+
+        let output = gemini_extract_chat_completions_text(&response).unwrap();
+        assert_eq!(output.tool_calls[0].id.as_deref(), Some("call-1"));
+        assert_eq!(
+            output.tool_calls[0].extra_content,
+            Some(json!({ "google": { "thought_signature": "signature-1" } }))
+        );
+    }
+
+    #[test]
+    fn replays_function_calls_and_responses_with_supported_gemini_roles() {
+        let mut call = ToolCall::new(
+            "probe".into(),
+            json!({ "value": 1 }),
+            Some("call-1".into()),
+        );
+        call.extra_content = Some(json!({
+            "google": { "thought_signature": "signature-1" }
+        }));
+        let message = Message::new(
+            MessageRole::Assistant,
+            MessageContent::ToolCalls(MessageContentToolCalls::new(
+                vec![ToolResult::new(call, json!({ "ok": true }))],
+                String::new(),
+            )),
+        );
+        let body = gemini_build_chat_completions_body(
+            ChatCompletionsData {
+                messages: vec![message],
+                temperature: None,
+                top_p: None,
+                functions: None,
+                stream: false,
+            },
+            &Model::new("gemini", "gemini-flash-lite-latest"),
+        )
+        .unwrap();
+
+        assert_eq!(body["contents"][0]["role"], "model");
+        assert_eq!(body["contents"][0]["parts"][0]["functionCall"]["id"], "call-1");
+        assert_eq!(body["contents"][0]["parts"][0]["thoughtSignature"], "signature-1");
+        assert_eq!(body["contents"][1]["role"], "user");
+        assert_eq!(body["contents"][1]["parts"][0]["functionResponse"]["id"], "call-1");
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
