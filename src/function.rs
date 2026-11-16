@@ -289,6 +289,12 @@ pub fn run_llm_function(
         Ok(None)
     };
 
+    if let Ok(Some(contents)) = &output {
+        if is_cancelled_tool_output(Some(contents)) {
+            bail!("Tool call was cancelled");
+        }
+    }
+
     match execution {
         Ok(0) => output,
         Ok(exit_code) => {
@@ -296,9 +302,6 @@ pub fn run_llm_function(
                 Ok(output) => (output, None),
                 Err(err) => (None, Some(err.to_string())),
             };
-            if is_cancelled_tool_output(output.as_deref()) {
-                bail!("Tool call was cancelled");
-            }
             let error = match output_error {
                 Some(err) => format!("Tool call exited with {exit_code}; {err}"),
                 None => format!("Tool call exited with {exit_code}"),
@@ -310,9 +313,6 @@ pub fn run_llm_function(
                 Ok(output) => (output, None),
                 Err(output_err) => (None, Some(output_err.to_string())),
             };
-            if is_cancelled_tool_output(output.as_deref()) {
-                bail!("Tool call was cancelled");
-            }
             let error = match output_error {
                 Some(output_err) => format!("{err}; {output_err}"),
                 None => err.to_string(),
@@ -406,6 +406,16 @@ mod tests {
     fn explicit_cancellation_remains_an_abort() {
         let (dir, script) =
             create_tool("printf 'CANCELLED action-id /tmp/target\\n' >> \"$LLM_OUTPUT\"; exit 2");
+        let error = run_tool(&script).unwrap_err();
+
+        assert_eq!(error.to_string(), "Tool call was cancelled");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cancellation_marker_aborts_even_when_tool_exits_successfully() {
+        let (dir, script) =
+            create_tool("printf 'CANCELLED action-id /tmp/target\\n' >> \"$LLM_OUTPUT\"; exit 0");
         let error = run_tool(&script).unwrap_err();
 
         assert_eq!(error.to_string(), "Tool call was cancelled");
