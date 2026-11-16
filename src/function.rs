@@ -382,7 +382,7 @@ mod tests {
 
         assert_eq!(result["error"], "Tool call exited with 7");
         assert_eq!(result["exit_code"], 7);
-        assert_eq!(result["output"], "partial result\\n");
+        assert_eq!(result["output"], "partial result\n");
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -393,7 +393,7 @@ mod tests {
         let result: Value = serde_json::from_str(&output).unwrap();
 
         assert_eq!(result["exit_code"], 2);
-        assert_eq!(result["output"], "ordinary failure\\n");
+        assert_eq!(result["output"], "ordinary failure\n");
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -423,7 +423,8 @@ mod tests {
     #[test]
     fn successful_tool_output_is_unchanged() {
         let (dir, script) = create_tool("printf 'success\\n' >> \"$LLM_OUTPUT\"");
-        assert_eq!(run_tool(&script).unwrap().as_deref(), Some("success\\n"));
+        assert_eq!(run_tool(&script).unwrap().as_deref(), Some("success\n"));
         fs::remove_dir_all(dir).unwrap();
     }
 }
+
