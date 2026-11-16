@@ -279,20 +279,66 @@ pub fn run_llm_function(
     if *IS_STDOUT_TERMINAL {
         println!("{}", dimmed_text(&prompt));
     }
-    let exit_code = run_command(&cmd_name, &cmd_args, Some(envs))
-        .map_err(|err| anyhow!("Unable to run {cmd_name}, {err}"))?;
-    if exit_code != 0 {
-        bail!("Tool call exit with {exit_code}");
-    }
-    let mut output = None;
-    if temp_file.exists() {
-        let contents =
-            fs::read_to_string(temp_file).context("Failed to retrieve tool call output")?;
-        if !contents.is_empty() {
-            output = Some(contents);
-        }
+    let execution = run_command(&cmd_name, &cmd_args, Some(envs))
+        .map_err(|err| anyhow!("Unable to run {cmd_name}, {err}"));
+    let output = if temp_file.exists() {
+        fs::read_to_string(&temp_file)
+            .context("Failed to retrieve tool call output")
+            .map(|contents| (!contents.is_empty()).then_some(contents))
+    } else {
+        Ok(None)
     };
-    Ok(output)
+
+    if let Ok(Some(contents)) = &output {
+        if is_cancelled_tool_output(Some(contents)) {
+            bail!("Tool call was cancelled");
+        }
+    }
+
+    match execution {
+        Ok(0) => output,
+        Ok(exit_code) => {
+            let (output, output_error) = match output {
+                Ok(output) => (output, None),
+                Err(err) => (None, Some(err.to_string())),
+            };
+            let error = match output_error {
+                Some(err) => format!("Tool call exited with {exit_code}; {err}"),
+                None => format!("Tool call exited with {exit_code}"),
+            };
+            Ok(Some(tool_failure_result(error, Some(exit_code), output)))
+        }
+        Err(err) => {
+            let (output, output_error) = match output {
+                Ok(output) => (output, None),
+                Err(output_err) => (None, Some(output_err.to_string())),
+            };
+            let error = match output_error {
+                Some(output_err) => format!("{err}; {output_err}"),
+                None => err.to_string(),
+            };
+            Ok(Some(tool_failure_result(error, None, output)))
+        }
+    }
+}
+
+fn is_cancelled_tool_output(output: Option<&str>) -> bool {
+    output.is_some_and(|output| {
+        output
+            .lines()
+            .any(|line| line.starts_with("CANCELLED ") || line.starts_with("CANCELLED:"))
+    })
+}
+
+fn tool_failure_result(error: String, exit_code: Option<i32>, output: Option<String>) -> String {
+    let mut result = json!({ "error": error });
+    if let Some(exit_code) = exit_code {
+        result["exit_code"] = json!(exit_code);
+    }
+    if let Some(output) = output {
+        result["output"] = json!(output);
+    }
+    result.to_string()
 }
 
 #[cfg(windows)]
@@ -309,4 +355,90 @@ fn polyfill_cmd_name<T: AsRef<Path>>(cmd_name: &str, bin_dir: &[T]) -> String {
         }
     }
     cmd_name
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::{fs, os::unix::fs::PermissionsExt};
+
+    fn create_tool(contents: &str) -> (PathBuf, PathBuf) {
+        let dir = temp_file("-function-test-", "");
+        fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("tool.sh");
+        fs::write(&script, format!("#!/bin/sh\n{contents}\n")).unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        (dir, script)
+    }
+
+    fn run_tool(script: &Path) -> Result<Option<String>> {
+        run_llm_function(
+            script.to_string_lossy().into_owned(),
+            vec![],
+            Default::default(),
+        )
+    }
+
+    #[test]
+    fn nonzero_tool_exit_returns_structured_result_and_output() {
+        let (dir, script) = create_tool("printf 'partial result\\n' >> \"$LLM_OUTPUT\"; exit 7");
+        let output = run_tool(&script).unwrap().unwrap();
+        let result: Value = serde_json::from_str(&output).unwrap();
+
+        assert_eq!(result["error"], "Tool call exited with 7");
+        assert_eq!(result["exit_code"], 7);
+        assert_eq!(result["output"], "partial result\n");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ordinary_exit_two_is_not_treated_as_cancellation() {
+        let (dir, script) = create_tool("printf 'ordinary failure\\n' >> \"$LLM_OUTPUT\"; exit 2");
+        let output = run_tool(&script).unwrap().unwrap();
+        let result: Value = serde_json::from_str(&output).unwrap();
+
+        assert_eq!(result["exit_code"], 2);
+        assert_eq!(result["output"], "ordinary failure\n");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn explicit_cancellation_remains_an_abort() {
+        let (dir, script) =
+            create_tool("printf 'CANCELLED action-id /tmp/target\\n' >> \"$LLM_OUTPUT\"; exit 2");
+        let error = run_tool(&script).unwrap_err();
+
+        assert_eq!(error.to_string(), "Tool call was cancelled");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cancellation_marker_aborts_even_when_tool_exits_successfully() {
+        let (dir, script) =
+            create_tool("printf 'CANCELLED action-id /tmp/target\\n' >> \"$LLM_OUTPUT\"; exit 0");
+        let error = run_tool(&script).unwrap_err();
+
+        assert_eq!(error.to_string(), "Tool call was cancelled");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn command_start_failure_returns_structured_result() {
+        let dir = temp_file("-function-test-missing-", "");
+        fs::create_dir_all(&dir).unwrap();
+        let missing = dir.join("missing-tool");
+        let output = run_tool(&missing).unwrap().unwrap();
+        let result: Value = serde_json::from_str(&output).unwrap();
+
+        assert!(result["error"].as_str().unwrap().contains("Unable to run"));
+        assert!(result.get("exit_code").is_none());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn successful_tool_output_is_unchanged() {
+        let (dir, script) = create_tool("printf 'success\\n' >> \"$LLM_OUTPUT\"");
+        assert_eq!(run_tool(&script).unwrap().as_deref(), Some("success\n"));
+        fs::remove_dir_all(dir).unwrap();
+    }
 }
