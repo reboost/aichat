@@ -324,7 +324,9 @@ pub fn run_llm_function(
 
 fn is_cancelled_tool_output(output: Option<&str>) -> bool {
     output.is_some_and(|output| {
-        output.lines().any(|line| line.starts_with("CANCELLED ") || line.starts_with("CANCELLED:"))
+        output
+            .lines()
+            .any(|line| line.starts_with("CANCELLED ") || line.starts_with("CANCELLED:"))
     })
 }
 
@@ -355,7 +357,6 @@ fn polyfill_cmd_name<T: AsRef<Path>>(cmd_name: &str, bin_dir: &[T]) -> String {
     cmd_name
 }
 
-
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -371,7 +372,11 @@ mod tests {
     }
 
     fn run_tool(script: &Path) -> Result<Option<String>> {
-        run_llm_function(script.to_string_lossy().into_owned(), vec![], Default::default())
+        run_llm_function(
+            script.to_string_lossy().into_owned(),
+            vec![],
+            Default::default(),
+        )
     }
 
     #[test]
@@ -427,4 +432,3 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 }
-
