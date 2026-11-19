@@ -58,6 +58,7 @@ dependencies = [
  "crossterm 0.28.1",
  "dirs",
  "duct",
+ "eventsource-stream",
  "fancy-regex",
  "futures-util",
  "fuzzy-matcher",
