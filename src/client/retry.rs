@@ -322,18 +322,38 @@ fn parse_google_duration(value: &str) -> Option<Duration> {
     Duration::from_secs(seconds).checked_add(Duration::from_nanos(nanos))
 }
 
+fn google_error_details(data: &Value) -> Vec<&Value> {
+    if let Some(details) = data
+        .pointer("/error/details")
+        .or_else(|| data.get("details"))
+        .and_then(Value::as_array)
+    {
+        return details.iter().collect();
+    }
+
+    let Some(envelopes) = data.as_array() else {
+        return Vec::new();
+    };
+    let wrapped_details = envelopes
+        .iter()
+        .filter_map(|envelope| envelope.pointer("/error/details").and_then(Value::as_array))
+        .flatten()
+        .collect::<Vec<_>>();
+
+    if wrapped_details.is_empty() {
+        envelopes.iter().collect()
+    } else {
+        wrapped_details
+    }
+}
+
 fn google_retry_info(body: &[u8]) -> Result<Option<Duration>, &'static str> {
     let Ok(data) = serde_json::from_slice::<Value>(body) else {
         return Ok(None);
     };
-    let details = data
-        .pointer("/error/details")
-        .or_else(|| data.get("details"))
-        .and_then(Value::as_array)
-        .or_else(|| data.as_array());
 
     let mut delay = None;
-    for detail in details.into_iter().flatten() {
+    for detail in google_error_details(&data) {
         if detail.get("@type").and_then(Value::as_str)
             != Some("type.googleapis.com/google.rpc.RetryInfo")
         {
@@ -363,11 +383,7 @@ fn google_has_daily_quota(data: &Value) -> bool {
         "GenerateContentInputTokensPerModelPerDay-FreeTier",
     ];
     // Gemini quota failures expose quota IDs such as GenerateRequestsPerDayPerProjectPerModel-FreeTier.
-    let details = data
-        .pointer("/error/details")
-        .or_else(|| data.get("details"))
-        .and_then(Value::as_array);
-    details.into_iter().flatten().any(|detail| {
+    google_error_details(data).into_iter().any(|detail| {
         if detail.get("@type").and_then(Value::as_str)
             != Some("type.googleapis.com/google.rpc.QuotaFailure")
         {
@@ -1164,6 +1180,69 @@ mod tests {
         assert!(request.await.unwrap_err().is_cancelled());
         assert_eq!(requests.load(Ordering::SeqCst), 1);
         server.await.unwrap();
+    }
+
+    const CAPTURED_GEMINI_RATE_LIMIT: &str = r#"[{"error":{"code":429,"message":"You exceeded your current quota, please check your plan and billing details. For more information on this error, head to: https://aistudio.google.com/docs/rate-limits. To monitor your current usage, head to: https://ai.dev/rate-limit. * Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_requests, limit: 15, model: gemini-3.5-flash-lite, description: Generate content requests per minute limit exceeded on Free Tier. See https://aistudio.google.com/docs/rate-limits.Please retry in 59.599883052s.","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.Help","links":[{"description":"Learn more about Gemini API quotas","url":"https://aistudio.google.com/docs/rate-limits"}]},{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{"description":"Generate content requests per minute limit exceeded on Free Tier. See https://aistudio.google.com/docs/rate-limits.","quotaMetric":"generativelanguage.googleapis.com/generate_content_free_tier_requests","quotaId":"GenerateRequestsPerMinutePerProjectPerModel-FreeTier","quotaDimensions":{"model":"gemini-3.5-flash-lite","location":"global"},"quotaValue":"15"}]},{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"59s"}]}}]"#;
+
+    fn production_default_policy() -> RetryPolicy {
+        RetryPolicy {
+            max_attempts: DEFAULT_MAX_ATTEMPTS,
+            max_duration: Duration::from_secs(DEFAULT_MAX_DURATION_SECS),
+            base_delay: Duration::from_millis(BASE_DELAY_MS),
+            max_backoff: Duration::from_millis(MAX_BACKOFF_MS),
+        }
+    }
+
+    #[test]
+    fn captured_gemini_array_envelope_retries_minute_quota_after_provider_delay() {
+        let body = ResponseBody {
+            bytes: CAPTURED_GEMINI_RATE_LIMIT.as_bytes().to_vec(),
+            truncated: false,
+        };
+        let data: Value = serde_json::from_slice(&body.bytes).unwrap();
+
+        assert!(data.is_array());
+        assert!(!google_has_daily_quota(&data));
+        assert!(permanent_failure(StatusCode::TOO_MANY_REQUESTS, &body.bytes).is_none());
+
+        let mut state = RetryState::new(production_default_policy());
+        let delay = state
+            .retry_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                &HeaderMap::new(),
+                &body,
+                true,
+            )
+            .unwrap();
+
+        assert!(delay >= Duration::from_secs(59), "{delay:?}");
+        assert_eq!(state.attempt, 2);
+    }
+
+    #[test]
+    fn array_wrapped_gemini_daily_quota_remains_permanent() {
+        let body = br#"[{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{"quotaId":"GenerateRequestsPerDayPerProjectPerModel-FreeTier"}]},{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"59s"}]}}]"#;
+        let data: Value = serde_json::from_slice(body).unwrap();
+
+        assert!(google_has_daily_quota(&data));
+        assert!(permanent_failure(StatusCode::TOO_MANY_REQUESTS, body).is_some());
+
+        let response_body = ResponseBody {
+            bytes: body.to_vec(),
+            truncated: false,
+        };
+        let mut state = RetryState::new(production_default_policy());
+        let error = state
+            .retry_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                &HeaderMap::new(),
+                &response_body,
+                true,
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("daily quota"));
+        assert_eq!(state.attempt, 1);
     }
 
     #[test]
