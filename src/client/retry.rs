@@ -127,14 +127,23 @@ impl RetryState {
             anyhow::bail!("{diagnostic}");
         }
 
-        match self.schedule(&format!("HTTP {}", status.as_u16()), retry_after) {
+        match self.schedule(
+            &format!("HTTP {}", status.as_u16()),
+            retry_after,
+            Some(&diagnostic),
+        ) {
             Ok(delay) => Ok(delay),
             Err(err) => Err(self.with_last_diagnostic(err)),
         }
     }
 
     pub(super) fn retry_connection(&mut self) -> Result<Duration> {
-        match self.schedule("connection failure before request submission", None) {
+        let diagnostic = self.last_diagnostic.clone();
+        match self.schedule(
+            "connection failure before request submission",
+            None,
+            diagnostic.as_deref(),
+        ) {
             Ok(delay) => Ok(delay),
             Err(err) => Err(self.with_last_diagnostic(err)),
         }
@@ -149,7 +158,12 @@ impl RetryState {
         }
     }
 
-    fn schedule(&mut self, reason: &str, retry_after: Option<Duration>) -> Result<Duration> {
+    fn schedule(
+        &mut self,
+        reason: &str,
+        retry_after: Option<Duration>,
+        diagnostic: Option<&str>,
+    ) -> Result<Duration> {
         if self.attempt >= self.policy.max_attempts {
             anyhow::bail!(
                 "HTTP recovery exhausted after {} attempts ({reason})",
@@ -168,12 +182,19 @@ impl RetryState {
         }
 
         self.attempt += 1;
-        log::warn!(
-            "Provider request failed ({reason}); retrying attempt {} of {} in {:.2}s",
-            self.attempt,
-            self.policy.max_attempts,
-            delay.as_secs_f64()
-        );
+        let attempt = self.attempt;
+        let max_attempts = self.policy.max_attempts;
+        let delay_secs = delay.as_secs_f64();
+        if let Some(diagnostic) = diagnostic {
+            let diagnostic = diagnostic.chars().take(1_000).collect::<String>();
+            log::warn!(
+                "Provider request failed ({reason}): {diagnostic}; retrying attempt {attempt} of {max_attempts} in {delay_secs:.2}s"
+            );
+        } else {
+            log::warn!(
+                "Provider request failed ({reason}); retrying attempt {attempt} of {max_attempts} in {delay_secs:.2}s"
+            );
+        }
         Ok(delay)
     }
 
@@ -327,10 +348,12 @@ fn parse_retry_delay(value: &Value) -> Option<Duration> {
         }
         _ => return None,
     };
-    if !seconds.is_finite() || !(0.0..=MAX_CONFIGURED_DURATION_SECS as f64).contains(&seconds) {
+    if !seconds.is_finite() || seconds < 0.0 {
         return None;
     }
-    Some(Duration::from_secs_f64(seconds))
+    Some(Duration::from_secs_f64(
+        seconds.min(MAX_CONFIGURED_DURATION_SECS as f64 + 1.0),
+    ))
 }
 
 fn contains_text_retry_hint(body: &[u8]) -> bool {
@@ -530,21 +553,14 @@ fn redact_json_secrets(value: &mut Value) {
                     .collect::<String>();
                 let sensitive = matches!(
                     key.as_str(),
-                    "key"
-                        | "apikey"
-                        | "authorization"
-                        | "token"
-                        | "accesstoken"
-                        | "refreshtoken"
-                        | "clientsecret"
-                        | "password"
-                        | "secret"
-                        | "credential"
-                        | "privatekey"
-                ) || key.ends_with("apikey")
-                    || key.ends_with("token")
-                    || key.ends_with("secret")
-                    || key.ends_with("password");
+                    "key" | "apikey" | "authorization" | "token" | "credential"
+                ) || key.contains("apikey")
+                    || key.contains("accesstoken")
+                    || key.contains("refreshtoken")
+                    || key.contains("secret")
+                    || key.contains("password")
+                    || key.contains("credential")
+                    || key.contains("privatekey");
                 if sensitive {
                     *value = Value::String("[REDACTED]".to_string());
                 } else {
@@ -570,6 +586,9 @@ fn redact_secret_text(value: &str) -> String {
         value = redact_prefixed_token(&value, prefix);
     }
     value
+        .chars()
+        .filter(|value| !value.is_control() || matches!(value, '\n' | '\t'))
+        .collect()
 }
 
 fn redact_assignment_values(input: &str) -> String {
@@ -577,11 +596,21 @@ fn redact_assignment_values(input: &str) -> String {
         "authorization",
         "access_token",
         "access-token",
+        "accesskey",
+        "secret_access_key",
+        "secret-access-key",
         "refresh_token",
+        "session_token",
+        "session-token",
         "client_secret",
         "private_key",
+        "private-key",
+        "secret_key",
+        "secret-key",
         "api_key",
         "api-key",
+        "x-api-key",
+        "x_api_key",
         "apikey",
         "password",
         "credential",
@@ -1312,9 +1341,10 @@ mod tests {
     #[tokio::test]
     async fn does_not_retry_hard_quota_or_billing_failures_with_retry_after() {
         let cases = [
-            r#"{"error":{"code":"ServiceQuotaExceededException","message":"Daily quota exhausted"}}"#,
-            r#"{"error":{"type":"insufficient_quota","message":"You exceeded your current quota"}}"#,
-            r#"{"error":{"type":"billing_hard_limit_reached","message":"Billing hard limit reached"}}"#,
+            r#"{"error":{"code":"ServiceQuotaExceededException","message":"Daily quota exhausted","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"1s"}]}}"#,
+            r#"{"error":{"type":"insufficient_quota","message":"You exceeded your current quota","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"1s"}]}}"#,
+            r#"{"error":{"type":"billing_hard_limit_reached","message":"Billing hard limit reached","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"1s"}]}}"#,
+            r#"{"error":{"message":"Monthly quota exhausted","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"1s"}]}}"#,
         ];
         for body in cases {
             let (url, requests, server) = spawn_server(vec![
