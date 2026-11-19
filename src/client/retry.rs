@@ -568,11 +568,14 @@ fn redact_json_secrets(value: &mut Value) {
                     "key" | "apikey" | "authorization" | "token" | "credential"
                 ) || key.contains("apikey")
                     || key.contains("accesstoken")
+                    || key.contains("accesskey")
                     || key.contains("refreshtoken")
+                    || key.contains("sessiontoken")
                     || key.contains("secret")
                     || key.contains("password")
                     || key.contains("credential")
-                    || key.contains("privatekey");
+                    || key.contains("privatekey")
+                    || key.contains("signature");
                 if sensitive {
                     *value = Value::String("[REDACTED]".to_string());
                 } else {
@@ -599,7 +602,7 @@ fn redact_secret_text(value: &str) -> String {
     }
     value
         .chars()
-        .filter(|value| !value.is_control() || matches!(*value, '\n' | '\t'))
+        .filter(|value| !value.is_control())
         .collect()
 }
 
