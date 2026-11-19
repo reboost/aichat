@@ -152,7 +152,7 @@ AIChat supports custom dark and light themes, which highlight response text and 
 
 ## Provider HTTP recovery
 
-Provider HTTP recovery is shared across providers. HTTP 429, 500, 502, 503, 504, and Anthropic-style 529 responses are retryable by default. Verified permanent billing, usage-limit, authentication, and structured Google daily/monthly quota failures are returned immediately; ordinary quota wording alone does not make a response permanent.
+Provider HTTP recovery is shared across providers. HTTP 429, 500, 502, 503, 504, and Anthropic-style 529 responses are retryable by default. Verified permanent billing, usage-limit, and authentication error codes, plus known structured Gemini daily-quota identifiers, are returned immediately; ordinary quota wording alone does not make a response permanent.
 
 Retries use bounded exponential backoff with jitter. The client honors the longer of the HTTP `Retry-After` header (delta-seconds or HTTP-date) and a documented, explicitly typed Google `google.rpc.RetryInfo.retryDelay`, then applies the backoff as a minimum. Google retry details are read only from the standard error details array or a top-level array of typed details. Unrelated JSON fields are not interpreted as retry instructions. A malformed recognized Google retry delay is reported and never replaced with a shorter fallback.
 
