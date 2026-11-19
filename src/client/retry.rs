@@ -217,6 +217,10 @@ fn permanent_failure(body: &[u8], has_retry_after: bool) -> Option<&'static str>
         "billing_not_active",
         "billing disabled",
         "billing error",
+        "billing_error",
+        "billing_limit_exceeded",
+        "insufficient_credits",
+        "credit_limit_exceeded",
         "payment_required",
         "payment required",
         "servicequotaexceeded",
@@ -241,6 +245,10 @@ fn permanent_failure(body: &[u8], has_retry_after: bool) -> Option<&'static str>
         "quota exceeded",
         "exceeded your current quota",
         "quota has been exceeded",
+        "quota is exhausted",
+        "quota exhausted",
+        "no remaining quota",
+        "out of quota",
         "daily quota",
         "monthly quota",
         "per-day quota",
@@ -614,6 +622,7 @@ mod tests {
             false
         )
         .is_some());
+        assert!(permanent_failure(br#"{"error":{"type":"billing_error"}}"#, false).is_some());
         assert!(permanent_failure(br#"{"error":{"reason":"QUOTA_EXCEEDED"}}"#, false).is_some());
         assert!(permanent_failure(
             br#"{"error":{"reason":"RATE_LIMIT_EXCEEDED","message":"Quota exceeded per minute"}}"#,
