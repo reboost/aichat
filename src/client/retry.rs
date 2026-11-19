@@ -658,13 +658,11 @@ mod tests {
         )
         .is_none());
         assert!(permanent_failure(br#"{"error":{"message":"Quota exceeded"}}"#, true).is_none());
-        assert!(
-            permanent_failure(
-                br#"{"error":{"code":"ServiceQuotaExceededException"}}"#,
-                false
-            )
-            .is_some()
-        );
+        assert!(permanent_failure(
+            br#"{"error":{"code":"ServiceQuotaExceededException"}}"#,
+            false
+        )
+        .is_some());
         assert!(
             permanent_failure(br#"{"error":{"code":"QuotaExceededException"}}"#, false).is_some()
         );
