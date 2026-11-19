@@ -152,14 +152,18 @@ AIChat supports custom dark and light themes, which highlight response text and 
 
 ## Provider HTTP recovery
 
-Provider requests automatically retry temporary rate limits and server overloads, including HTTP 429, 500, 502, 503, 504, and Anthropic-style 529 responses. Retries respect `Retry-After`, use exponential backoff with jitter, and stop after a bounded number of attempts or the configured total duration. Permanent billing, quota, authentication, and invalid-request errors are returned without retrying.
+Provider HTTP recovery is shared across providers. HTTP 429, 500, 502, 503, 504, and Anthropic-style 529 responses are retryable by default. Verified permanent billing, usage-limit, authentication, and structured Google daily/monthly quota failures are returned immediately; ordinary quota wording alone does not make a response permanent.
+
+Retries use bounded exponential backoff with jitter. The client honors the longer of the HTTP `Retry-After` header (delta-seconds or HTTP-date) and a documented, explicitly typed Google `google.rpc.RetryInfo.retryDelay`, then applies the backoff as a minimum. Google retry details are read only from the standard error details array or a top-level array of typed details. Unrelated JSON fields are not interpreted as retry instructions. A malformed recognized Google retry delay is reported and never replaced with a shorter fallback.
 
 Retry limits can be adjusted with:
 
-- `AICHAT_HTTP_RETRY_MAX_ATTEMPTS`: total attempts, including the first request (default: `4`, range: `1–10`).
-- `AICHAT_HTTP_RETRY_MAX_DURATION_SECS`: maximum total retry duration (default: `30`, range: `0–300` seconds).
+- `AICHAT_HTTP_RETRY_MAX_ATTEMPTS`: total requests, including the initial request (default: `6`, range: `1–10`).
+- `AICHAT_HTTP_RETRY_MAX_DURATION_SECS`: maximum elapsed retry duration, including request time and waits (default: `120`, range: `0–300` seconds).
 
-Streaming requests are retried only before the stream is accepted. A request is not replayed after stream content begins, nor after an ambiguous request timeout that may have occurred after provider submission.
+A provider-requested delay is never shortened to fit the elapsed-time budget; recovery stops with the provider diagnostic when the full delay cannot fit. Connection-establishment failures may be retried for cloneable requests, but ambiguous request timeouts are not replayed. Non-cloneable requests are sent only once.
+
+SSE handshakes may retry only before the stream opens. Once the stream is open, or a successful streaming response has been handed to the caller, the request is never replayed after partial output. Request cloneability does not guarantee operation idempotency: retrying server errors such as 500 or 503 can duplicate provider work or billing if the provider processed the operation before returning the error. The shared helper does not provide exactly-once execution.
 
 ## Documentation
 
