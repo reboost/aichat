@@ -121,7 +121,10 @@ fn response_error_message(status: StatusCode, body: &ResponseBody) -> String {
     } else {
         &body
     };
-    bound_diagnostic(format!("Provider returned HTTP {}: {body}", status.as_u16()))
+    bound_diagnostic(format!(
+        "Provider returned HTTP {}: {body}",
+        status.as_u16()
+    ))
 }
 
 pub(super) struct RetryState {
@@ -187,7 +190,9 @@ impl RetryState {
             );
         }
 
-        let delay = self.backoff_delay().max(requested_delay.unwrap_or_default());
+        let delay = self
+            .backoff_delay()
+            .max(requested_delay.unwrap_or_default());
         if self.started.elapsed().saturating_add(delay) > self.policy.max_duration {
             anyhow::bail!(
                 "HTTP recovery stopped after {} attempts because the next delay ({:.2}s) exceeds the maximum retry duration ({:.2}s); {reason}",
@@ -280,7 +285,10 @@ async fn send_with_retry_policy(builder: RequestBuilder, policy: RetryPolicy) ->
 }
 
 pub(super) fn is_retryable_status(status: StatusCode) -> bool {
-    matches!(status.as_u16(), 408 | 425 | 429 | 500 | 502 | 503 | 504 | 529)
+    matches!(
+        status.as_u16(),
+        408 | 425 | 429 | 500 | 502 | 503 | 504 | 529
+    )
 }
 
 fn parse_retry_after_header(headers: &HeaderMap) -> Option<Duration> {
@@ -437,7 +445,9 @@ fn permanent_failure(status: StatusCode, body: &[u8]) -> Option<&'static str> {
         return Some("The provider reports a permanent billing or usage limit; check its billing and quota settings");
     }
     if has_code(AUTH_CODES) {
-        return Some("The provider rejected the request credentials; check the authentication configuration");
+        return Some(
+            "The provider rejected the request credentials; check the authentication configuration",
+        );
     }
     if google_has_daily_quota(&data) {
         return Some("Google reports a documented daily quota violation; retrying within the configured window is unlikely to help");
@@ -1248,12 +1258,20 @@ mod tests {
     #[test]
     fn parses_supported_retry_instructions_and_classifies_verified_failures() {
         let nested = br#"{"error":{"details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"59s"}]}}"#;
-        assert_eq!(google_retry_info(nested).unwrap(), Some(Duration::from_secs(59)));
+        assert_eq!(
+            google_retry_info(nested).unwrap(),
+            Some(Duration::from_secs(59))
+        );
 
-        let top_level = br#"[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"1.5s"}]"#;
-        assert_eq!(google_retry_info(top_level).unwrap(), Some(Duration::from_millis(1500)));
+        let top_level =
+            br#"[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"1.5s"}]"#;
+        assert_eq!(
+            google_retry_info(top_level).unwrap(),
+            Some(Duration::from_millis(1500))
+        );
 
-        let unrelated = br#"{"metadata":{"retryDelay":"1s"},"error":{"message":"retry later","retryAfter":2}}"#;
+        let unrelated =
+            br#"{"metadata":{"retryDelay":"1s"},"error":{"message":"retry later","retryAfter":2}}"#;
         assert_eq!(google_retry_info(unrelated).unwrap(), None);
 
         let malformed = br#"{"error":{"details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"later"}]}}"#;
@@ -1261,11 +1279,20 @@ mod tests {
 
         let mut headers = HeaderMap::new();
         headers.insert(RETRY_AFTER, "2".parse().unwrap());
-        assert_eq!(parse_retry_after_header(&headers), Some(Duration::from_secs(2)));
+        assert_eq!(
+            parse_retry_after_header(&headers),
+            Some(Duration::from_secs(2))
+        );
         let longer_google = br#"{"error":{"details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"3.5s"}]}}"#;
-        assert_eq!(retry_delay(&headers, longer_google).unwrap(), Some(Duration::from_millis(3500)));
+        assert_eq!(
+            retry_delay(&headers, longer_google).unwrap(),
+            Some(Duration::from_millis(3500))
+        );
         let longer_header = br#"{"error":{"details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"1s"}]}}"#;
-        assert_eq!(retry_delay(&headers, longer_header).unwrap(), Some(Duration::from_secs(2)));
+        assert_eq!(
+            retry_delay(&headers, longer_header).unwrap(),
+            Some(Duration::from_secs(2))
+        );
 
         let date = (Utc::now() + chrono::Duration::seconds(2))
             .format("%a, %d %b %Y %H:%M:%S GMT")
@@ -1276,27 +1303,33 @@ mod tests {
         assert!(permanent_failure(
             StatusCode::TOO_MANY_REQUESTS,
             br#"{"error":{"type":"insufficient_quota"}}"#
-        ).is_some());
+        )
+        .is_some());
         assert!(permanent_failure(
             StatusCode::TOO_MANY_REQUESTS,
             br#"{"error":{"code":"project_spend_limit_exceeded"}}"#
-        ).is_some());
+        )
+        .is_some());
         assert!(permanent_failure(
             StatusCode::TOO_MANY_REQUESTS,
             br#"{"error":{"code":"invalid_api_key"}}"#
-        ).is_some());
+        )
+        .is_some());
         assert!(permanent_failure(
             StatusCode::TOO_MANY_REQUESTS,
             br#"{"error":{"code":"ServiceQuotaExceededException"}}"#
-        ).is_none());
+        )
+        .is_none());
         assert!(permanent_failure(
             StatusCode::TOO_MANY_REQUESTS,
             br#"{"error":{"message":"Daily quota exceeded; please retry tomorrow"}}"#
-        ).is_none());
+        )
+        .is_none());
         assert!(permanent_failure(
             StatusCode::BAD_GATEWAY,
             br#"{"error":{"type":"insufficient_quota"}}"#
-        ).is_none());
+        )
+        .is_none());
 
         let google_daily = br#"{"error":{"details":[{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{"quotaId":"GenerateRequestsPerDayPerProjectPerModel-FreeTier"}]},{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"59s"}]}}"#;
         assert!(permanent_failure(StatusCode::TOO_MANY_REQUESTS, google_daily).is_some());
@@ -1321,7 +1354,9 @@ mod tests {
 
         let mut long_delay = RetryState::new(policy);
         assert_eq!(
-            long_delay.schedule("HTTP 429", Some(Duration::from_secs(59))).unwrap(),
+            long_delay
+                .schedule("HTTP 429", Some(Duration::from_secs(59)))
+                .unwrap(),
             Duration::from_secs(59)
         );
 
@@ -1345,10 +1380,9 @@ mod tests {
             MockResponse::json(200, r#"{"ok":true}"#),
         ];
         let (url, requests, server) = spawn_server(responses).await;
-        let response =
-            send_with_retry_policy(post(&reqwest::Client::new(), &url), quick_policy(6))
-                .await
-                .unwrap();
+        let response = send_with_retry_policy(post(&reqwest::Client::new(), &url), quick_policy(6))
+            .await
+            .unwrap();
 
         assert!(response.status().is_success());
         assert_eq!(requests.load(Ordering::SeqCst), 5);
@@ -1363,11 +1397,10 @@ mod tests {
             MockResponse::json(200, r#"{"ok":true}"#),
         ])
         .await;
-        let error =
-            send_with_retry_policy(post(&reqwest::Client::new(), &url), quick_policy(3))
-                .await
-                .unwrap_err()
-                .to_string();
+        let error = send_with_retry_policy(post(&reqwest::Client::new(), &url), quick_policy(3))
+            .await
+            .unwrap_err()
+            .to_string();
 
         assert!(error.contains("HTTP 429"), "{error}");
         assert!(error.contains("malformed retryDelay"), "{error}");
@@ -1487,7 +1520,7 @@ mod tests {
         ];
         for body in cases {
             let (url, requests, server) = spawn_server(vec![
-                MockResponse::json(429, body).header("Retry-After", "0"),
+                MockResponse::json(429, body).header("Retry-After", "0")
             ])
             .await;
             let error =
@@ -1509,9 +1542,10 @@ mod tests {
             r#"{"message":"Temporarily unavailable"}"#,
         )])
         .await;
-        let body = reqwest::Body::wrap_stream(futures_util::stream::iter(vec![
-            Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"one-shot body")),
-        ]));
+        let body =
+            reqwest::Body::wrap_stream(futures_util::stream::iter(vec![Ok::<_, std::io::Error>(
+                bytes::Bytes::from_static(b"one-shot body"),
+            )]));
         let request = reqwest::Client::new()
             .post(&url)
             .header("content-type", "application/octet-stream")
