@@ -162,9 +162,7 @@ where
                     es.close();
                     break;
                 }
-                Err(EventSourceError::Transport(err))
-                    if !opened && err.is_connect() =>
-                {
+                Err(EventSourceError::Transport(err)) if !opened && err.is_connect() => {
                     retry_delay = Some(retry_state.retry_connection()?);
                     es.close();
                     break;

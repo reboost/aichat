@@ -246,7 +246,9 @@ fn permanent_failure(body: &[u8], has_retry_after: bool) -> Option<&'static str>
     .iter()
     .any(|value| text.contains(value));
     if hard_exhausted_quota {
-        return Some("The provider reports an exhausted quota; check its quota limits or billing settings");
+        return Some(
+            "The provider reports an exhausted quota; check its quota limits or billing settings",
+        );
     }
 
     // These provider error codes are ambiguous on their own: rate/quota
@@ -656,8 +658,16 @@ mod tests {
         )
         .is_none());
         assert!(permanent_failure(br#"{"error":{"message":"Quota exceeded"}}"#, true).is_none());
-        assert!(permanent_failure(br#"{"error":{"code":"ServiceQuotaExceededException"}}"#, false).is_some());
-        assert!(permanent_failure(br#"{"error":{"code":"QuotaExceededException"}}"#, false).is_some());
+        assert!(
+            permanent_failure(
+                br#"{"error":{"code":"ServiceQuotaExceededException"}}"#,
+                false
+            )
+            .is_some()
+        );
+        assert!(
+            permanent_failure(br#"{"error":{"code":"QuotaExceededException"}}"#, false).is_some()
+        );
 
         let mut headers = HeaderMap::new();
         headers.insert(RETRY_AFTER, "2".parse().unwrap());
@@ -724,13 +734,10 @@ mod tests {
         server.await.unwrap();
     }
 
-
     #[tokio::test]
     async fn retries_ambiguous_quota_exceptions_when_server_signals_retry() {
         for code in ["ServiceQuotaExceededException", "QuotaExceededException"] {
-            let body = format!(
-                r#"{{"error":{{"code":"{code}","message":"Quota exceeded"}}}}"#
-            );
+            let body = format!(r#"{{"error":{{"code":"{code}","message":"Quota exceeded"}}}}"#);
             let (url, requests, server) = spawn_server(vec![
                 MockResponse::json(429, &body).header("Retry-After", "0"),
                 MockResponse::json(200, r#"{"ok":true}"#),
@@ -756,7 +763,7 @@ mod tests {
         ];
         for body in cases {
             let (url, requests, server) = spawn_server(vec![
-                MockResponse::json(429, body).header("Retry-After", "0"),
+                MockResponse::json(429, body).header("Retry-After", "0")
             ])
             .await;
             let error =
@@ -774,9 +781,10 @@ mod tests {
     async fn does_not_retry_non_cloneable_sse_request() {
         let (url, requests, server) =
             spawn_server(vec![MockResponse::sse("data: single-response\n\n")]).await;
-        let body = reqwest::Body::wrap_stream(futures_util::stream::iter(vec![
-            Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"non-cloneable request body")),
-        ]));
+        let body =
+            reqwest::Body::wrap_stream(futures_util::stream::iter(vec![Ok::<_, std::io::Error>(
+                bytes::Bytes::from_static(b"non-cloneable request body"),
+            )]));
         let request = reqwest::Client::new()
             .post(&url)
             .header("content-type", "application/octet-stream")
