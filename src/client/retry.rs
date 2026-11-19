@@ -201,8 +201,6 @@ fn permanent_failure(body: &[u8], has_retry_after: bool) -> Option<&'static str>
             "per second",
             "per-second",
             "requests per minute",
-            "servicequotaexceeded",
-            "quotaexceededexception",
         ]
         .iter()
         .any(|value| text.contains(value));
@@ -219,8 +217,6 @@ fn permanent_failure(body: &[u8], has_retry_after: bool) -> Option<&'static str>
         "credit_limit_exceeded",
         "payment_required",
         "payment required",
-        "servicequotaexceeded",
-        "quotaexceededexception",
         "credit balance is too low",
         "account_deactivated",
         "account is deactivated",
@@ -235,12 +231,9 @@ fn permanent_failure(body: &[u8], has_retry_after: bool) -> Option<&'static str>
         );
     }
 
-    let exhausted_quota = [
+    let hard_exhausted_quota = [
         "permanent quota",
-        "quota_exceeded",
-        "quota exceeded",
         "exceeded your current quota",
-        "quota has been exceeded",
         "quota is exhausted",
         "quota exhausted",
         "no remaining quota",
@@ -252,8 +245,23 @@ fn permanent_failure(body: &[u8], has_retry_after: bool) -> Option<&'static str>
     ]
     .iter()
     .any(|value| text.contains(value));
+    if hard_exhausted_quota {
+        return Some("The provider reports an exhausted quota; check its quota limits or billing settings");
+    }
 
-    if exhausted_quota && !retry_hint {
+    // These provider error codes are ambiguous on their own: rate/quota
+    // windows can recover, while exhausted account quotas cannot.
+    let ambiguous_quota = [
+        "servicequotaexceeded",
+        "quotaexceededexception",
+        "quota_exceeded",
+        "quota exceeded",
+        "quota has been exceeded",
+    ]
+    .iter()
+    .any(|value| text.contains(value));
+
+    if ambiguous_quota && !retry_hint {
         Some("The provider reports an exhausted quota; check its quota limits or billing settings")
     } else {
         None
@@ -438,7 +446,16 @@ mod tests {
                             .flatten()
                     })
                     .unwrap_or_default();
-                if bytes.len() >= header_end + 4 + content_length {
+                let body = &bytes[header_end + 4..];
+                let is_chunked = headers.lines().any(|line| {
+                    line.split_once(':').is_some_and(|(name, value)| {
+                        name.eq_ignore_ascii_case("transfer-encoding")
+                            && value.to_ascii_lowercase().contains("chunked")
+                    })
+                });
+                if (is_chunked && chunked_body_complete(body))
+                    || (!is_chunked && bytes.len() >= header_end + 4 + content_length)
+                {
                     return;
                 }
             }
@@ -447,6 +464,31 @@ mod tests {
 
     fn post(client: &reqwest::Client, url: &str) -> RequestBuilder {
         client.post(url).json(&json!({"input": "test"}))
+    }
+
+    fn chunked_body_complete(mut body: &[u8]) -> bool {
+        loop {
+            let Some(line_end) = body.windows(2).position(|value| value == b"\\r\\n") else {
+                return false;
+            };
+            let size_line = String::from_utf8_lossy(&body[..line_end]);
+            let size = size_line
+                .split(';')
+                .next()
+                .and_then(|value| usize::from_str_radix(value.trim(), 16).ok());
+            let Some(size) = size else {
+                return false;
+            };
+            body = &body[line_end + 2..];
+            if size == 0 {
+                return body.starts_with(b"\\r\\n")
+                    || body.windows(4).any(|value| value == b"\\r\\n\\r\\n");
+            }
+            if body.len() < size + 2 || &body[size..size + 2] != b"\\r\\n" {
+                return false;
+            }
+            body = &body[size + 2..];
+        }
     }
 
     #[tokio::test]
@@ -614,6 +656,8 @@ mod tests {
         )
         .is_none());
         assert!(permanent_failure(br#"{"error":{"message":"Quota exceeded"}}"#, true).is_none());
+        assert!(permanent_failure(br#"{"error":{"code":"ServiceQuotaExceededException"}}"#, false).is_some());
+        assert!(permanent_failure(br#"{"error":{"code":"QuotaExceededException"}}"#, false).is_some());
 
         let mut headers = HeaderMap::new();
         headers.insert(RETRY_AFTER, "2".parse().unwrap());
@@ -677,6 +721,82 @@ mod tests {
         assert_eq!(handled, 1);
         assert_eq!(calls.len(), 1);
         assert_eq!(requests.load(Ordering::SeqCst), 2);
+        server.await.unwrap();
+    }
+
+
+    #[tokio::test]
+    async fn retries_ambiguous_quota_exceptions_when_server_signals_retry() {
+        for code in ["ServiceQuotaExceededException", "QuotaExceededException"] {
+            let body = format!(
+                r#"{{"error":{{"code":"{code}","message":"Quota exceeded"}}}}"#
+            );
+            let (url, requests, server) = spawn_server(vec![
+                MockResponse::json(429, &body).header("Retry-After", "0"),
+                MockResponse::json(200, r#"{"ok":true}"#),
+            ])
+            .await;
+            let response =
+                send_with_retry_policy(post(&reqwest::Client::new(), &url), quick_policy(3))
+                    .await
+                    .unwrap();
+
+            assert!(response.status().is_success(), "{code}");
+            assert_eq!(requests.load(Ordering::SeqCst), 2, "{code}");
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn does_not_retry_hard_quota_or_billing_failures_with_retry_after() {
+        let cases = [
+            r#"{"error":{"code":"ServiceQuotaExceededException","message":"Daily quota exhausted"}}"#,
+            r#"{"error":{"type":"insufficient_quota","message":"You exceeded your current quota"}}"#,
+            r#"{"error":{"type":"billing_hard_limit_reached","message":"Billing hard limit reached"}}"#,
+        ];
+        for body in cases {
+            let (url, requests, server) = spawn_server(vec![
+                MockResponse::json(429, body).header("Retry-After", "0"),
+            ])
+            .await;
+            let error =
+                send_with_retry_policy(post(&reqwest::Client::new(), &url), quick_policy(4))
+                    .await
+                    .unwrap_err();
+
+            assert!(error.to_string().contains("HTTP 429"));
+            assert_eq!(requests.load(Ordering::SeqCst), 1, "{body}");
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn does_not_retry_non_cloneable_sse_request() {
+        let (url, requests, server) =
+            spawn_server(vec![MockResponse::sse("data: single-response\\n\\n")]).await;
+        let body = reqwest::Body::wrap_stream(futures_util::stream::iter(vec![
+            Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"non-cloneable request body")),
+        ]));
+        let request = reqwest::Client::new()
+            .post(&url)
+            .header("content-type", "application/octet-stream")
+            .body(body);
+        assert!(request.try_clone().is_none());
+
+        let mut delivered = Vec::new();
+        super::super::stream::sse_stream_with_policy(
+            request,
+            |message| {
+                delivered.push(message.data);
+                Ok(false)
+            },
+            quick_policy(4),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(delivered, vec!["single-response"]);
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
         server.await.unwrap();
     }
 

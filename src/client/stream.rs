@@ -106,12 +106,21 @@ pub(super) async fn sse_stream_with_policy<F>(
 where
     F: FnMut(SseMmessage) -> Result<bool>,
 {
+    let can_retry = builder.try_clone().is_some();
+    let mut builder = Some(builder);
     let mut retry_state = RetryState::new(policy);
 
     loop {
-        let attempt_builder = builder
-            .try_clone()
-            .ok_or_else(|| anyhow!("Streaming request cannot be safely cloned for retries"))?;
+        let attempt_builder = if can_retry {
+            builder
+                .as_ref()
+                .and_then(RequestBuilder::try_clone)
+                .ok_or_else(|| anyhow!("Streaming request cannot be safely cloned for retries"))?
+        } else {
+            builder
+                .take()
+                .ok_or_else(|| anyhow!("Streaming request was already sent"))?
+        };
         let mut es = attempt_builder.eventsource()?;
         // Disable reqwest-eventsource's automatic reconnects; all retries must pass
         // through the shared policy, and no request may be replayed after Open.
@@ -139,7 +148,7 @@ where
                 Err(EventSourceError::InvalidStatusCode(status, response)) => {
                     let headers = response.headers().clone();
                     let body = response.text().await?;
-                    if is_retryable_status(status) {
+                    if can_retry && is_retryable_status(status) {
                         retry_delay =
                             Some(retry_state.retry_response(status, &headers, body.as_bytes())?);
                     } else {
@@ -157,7 +166,9 @@ where
                     es.close();
                     break;
                 }
-                Err(EventSourceError::Transport(err)) if !opened && err.is_connect() => {
+                Err(EventSourceError::Transport(err))
+                    if can_retry && !opened && err.is_connect() =>
+                {
                     retry_delay = Some(retry_state.retry_connection()?);
                     es.close();
                     break;
