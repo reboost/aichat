@@ -159,9 +159,11 @@ Retries use bounded exponential backoff with jitter. The client honors the longe
 Retry limits can be adjusted with:
 
 - `AICHAT_HTTP_RETRY_MAX_ATTEMPTS`: total requests, including the initial request (default: `6`, range: `1–10`).
-- `AICHAT_HTTP_RETRY_MAX_DURATION_SECS`: maximum elapsed retry duration, including request time and waits (default: `120`, range: `0–300` seconds).
+- `AICHAT_HTTP_RETRY_MAX_DURATION_SECS`: retry-admission budget measured from the initial request, including time spent waiting and making requests (default: `300`, range: `0–300` seconds). This budget decides whether another retry may start; it is not a strict request timeout and does not cancel an in-flight request.
 
-A provider-requested delay is never shortened to fit the elapsed-time budget; recovery stops with the provider diagnostic when the full delay cannot fit. Connection-establishment failures may be retried for cloneable requests, but ambiguous request timeouts are not replayed. Non-cloneable requests are sent only once.
+A provider-requested delay is never shortened to fit the remaining admission budget; when the full wait cannot fit, recovery stops instead of retrying early. Connection-establishment failures may be retried for cloneable requests, but ambiguous request timeouts are not replayed. Non-cloneable requests are sent only once.
+
+Terminal HTTP errors retain the HTTP status and latest provider response body, including its message, codes, details, and quota information. The retry/stop explanation is added as context rather than replacing the provider error. The response body is preserved verbatim when no redaction is needed; credential fields and recognized authentication tokens are redacted. Error bodies are limited to 64 KiB, with an explicit truncation marker when that safety limit is reached. Transport failures are identified separately as attempts for which no provider HTTP response was received; any earlier provider response remains visible.
 
 SSE handshakes may retry only before the stream opens. Once the stream is open, or a successful streaming response has been handed to the caller, the request is never replayed after partial output. Request cloneability does not guarantee operation idempotency: retrying a request after a retryable HTTP response (including 408, 425, and server errors) can duplicate provider work or billing if the provider processed the operation before returning the response. The shared helper does not provide exactly-once execution.
 
