@@ -1,9 +1,11 @@
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
+use futures_util::StreamExt;
 use reqwest::{
     header::{HeaderMap, RETRY_AFTER},
     RequestBuilder, Response, StatusCode,
 };
+use serde_json::Value;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_MAX_ATTEMPTS: usize = 4;
@@ -12,6 +14,7 @@ const MAX_CONFIGURED_ATTEMPTS: usize = 10;
 const MAX_CONFIGURED_DURATION_SECS: u64 = 300;
 const BASE_DELAY_MS: u64 = 250;
 const MAX_BACKOFF_MS: u64 = 8_000;
+const MAX_ERROR_RESPONSE_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy)]
 pub(super) struct RetryPolicy {
@@ -43,10 +46,51 @@ impl RetryPolicy {
     }
 }
 
+pub(super) struct ResponseBody {
+    pub(super) bytes: Vec<u8>,
+    pub(super) truncated: bool,
+}
+
+pub(super) async fn read_response_body(response: Response) -> Result<ResponseBody> {
+    let status = response.status();
+    let mut stream = response.bytes_stream();
+    let mut bytes = Vec::new();
+    let mut truncated = false;
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.with_context(|| {
+            format!("Failed to read provider error response (HTTP {})", status.as_u16())
+        })?;
+        let remaining = MAX_ERROR_RESPONSE_BYTES.saturating_sub(bytes.len());
+        if chunk.len() > remaining {
+            bytes.extend_from_slice(&chunk[..remaining]);
+            truncated = true;
+            break;
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+
+    Ok(ResponseBody { bytes, truncated })
+}
+
+pub(super) fn response_body_text(body: &ResponseBody) -> String {
+    let text = redact_secret_text(&String::from_utf8_lossy(&body.bytes));
+    if body.truncated {
+        format!("{text}\n[response body truncated after {MAX_ERROR_RESPONSE_BYTES} bytes]")
+    } else {
+        text
+    }
+}
+
+pub(super) fn format_response_error(status: StatusCode, body: &ResponseBody) -> String {
+    response_error_message(status, body)
+}
+
 pub(super) struct RetryState {
     policy: RetryPolicy,
     started: Instant,
     attempt: usize,
+    last_diagnostic: Option<String>,
 }
 
 impl RetryState {
@@ -55,6 +99,7 @@ impl RetryState {
             policy,
             started: Instant::now(),
             attempt: 1,
+            last_diagnostic: None,
         }
     }
 
@@ -62,23 +107,46 @@ impl RetryState {
         &mut self,
         status: StatusCode,
         headers: &HeaderMap,
-        body: &[u8],
+        body: &ResponseBody,
+        allow_retry: bool,
     ) -> Result<Duration> {
-        let message = response_error_message(status, body);
-        let retry_after = parse_retry_after(headers);
-        if let Some(reason) = permanent_failure(body, retry_after.is_some()) {
-            anyhow::bail!("{message}. {reason}");
+        let diagnostic = response_error_message(status, body);
+        self.last_diagnostic = Some(diagnostic.clone());
+
+        let structured_hint = structured_retry_hint(&body.bytes);
+        let header_retry_after = parse_retry_after_header(headers);
+        let retry_after = header_retry_after.or(structured_hint.delay);
+        let has_retry_signal = header_retry_after.is_some()
+            || structured_hint.explicit
+            || contains_text_retry_hint(&body.bytes);
+
+        if let Some(reason) = permanent_failure(&body.bytes, has_retry_signal) {
+            anyhow::bail!("{diagnostic}. {reason}");
         }
-        if !is_retryable_status(status) {
-            anyhow::bail!("{message}");
+        if !allow_retry || !is_retryable_status(status) {
+            anyhow::bail!("{diagnostic}");
         }
 
-        self.schedule(&format!("HTTP {}", status.as_u16()), retry_after)
-            .map_err(|err| anyhow!("{message}; {err}"))
+        match self.schedule(&format!("HTTP {}", status.as_u16()), retry_after) {
+            Ok(delay) => Ok(delay),
+            Err(err) => Err(self.with_last_diagnostic(err)),
+        }
     }
 
     pub(super) fn retry_connection(&mut self) -> Result<Duration> {
-        self.schedule("connection failure before request submission", None)
+        match self.schedule("connection failure before request submission", None) {
+            Ok(delay) => Ok(delay),
+            Err(err) => Err(self.with_last_diagnostic(err)),
+        }
+    }
+
+    pub(super) fn with_last_diagnostic(&self, err: anyhow::Error) -> anyhow::Error {
+        match &self.last_diagnostic {
+            Some(diagnostic) if !err.to_string().contains(diagnostic) => {
+                anyhow!("{diagnostic}; {err}")
+            }
+            _ => err,
+        }
     }
 
     fn schedule(&mut self, reason: &str, retry_after: Option<Duration>) -> Result<Duration> {
@@ -132,42 +200,52 @@ pub(crate) async fn send_with_retry(builder: RequestBuilder) -> Result<Response>
 }
 
 async fn send_with_retry_policy(builder: RequestBuilder, policy: RetryPolicy) -> Result<Response> {
+    let allow_retry = builder.try_clone().is_some();
+    let mut builder = Some(builder);
     let mut state = RetryState::new(policy);
 
     loop {
-        let request = match builder.try_clone() {
-            Some(request) => request,
-            None => return builder.send().await.map_err(Into::into),
+        let request = if allow_retry {
+            builder
+                .as_ref()
+                .and_then(RequestBuilder::try_clone)
+                .ok_or_else(|| anyhow!("Request could not be cloned for a retry"))?
+        } else {
+            builder
+                .take()
+                .ok_or_else(|| anyhow!("Non-cloneable request was already sent"))?
         };
 
-        match request.send().await {
-            Ok(response) => {
-                let status = response.status();
-                if !is_retryable_status(status) {
-                    return Ok(response);
-                }
-
-                let headers = response.headers().clone();
-                let body = response.bytes().await.with_context(|| {
-                    format!(
-                        "Failed to read provider error response (HTTP {})",
-                        status.as_u16()
-                    )
-                })?;
-                let delay = state.retry_response(status, &headers, &body)?;
-                tokio::time::sleep(delay).await;
-            }
-            Err(err) if err.is_connect() => {
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(err) if allow_retry && err.is_connect() => {
                 let delay = state.retry_connection()?;
                 tokio::time::sleep(delay).await;
+                continue;
             }
             Err(err) if err.is_timeout() => {
-                anyhow::bail!(
-                    "Provider request timed out and was not replayed because the provider may have received it"
+                let error = anyhow!(
+                    "Provider request timed out and was not replayed because the provider may have received it: {}",
+                    err.without_url()
                 );
+                return Err(state.with_last_diagnostic(error));
             }
-            Err(err) => return Err(err.without_url().into()),
+            Err(err) => {
+                return Err(state.with_last_diagnostic(err.without_url().into()));
+            }
+        };
+
+        if response.status().is_success() {
+            return Ok(response);
         }
+
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = read_response_body(response)
+            .await
+            .map_err(|err| state.with_last_diagnostic(err))?;
+        let delay = state.retry_response(status, &headers, &body, allow_retry)?;
+        tokio::time::sleep(delay).await;
     }
 }
 
@@ -175,7 +253,7 @@ pub(super) fn is_retryable_status(status: StatusCode) -> bool {
     matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504 | 529)
 }
 
-fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
+fn parse_retry_after_header(headers: &HeaderMap) -> Option<Duration> {
     let value = headers.get(RETRY_AFTER)?.to_str().ok()?;
     if let Ok(seconds) = value.parse::<u64>() {
         return Some(Duration::from_secs(seconds));
@@ -186,24 +264,99 @@ fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
     Some(Duration::from_secs(seconds.max(0) as u64))
 }
 
-fn permanent_failure(body: &[u8], has_retry_after: bool) -> Option<&'static str> {
+#[derive(Default)]
+struct StructuredRetryHint {
+    explicit: bool,
+    delay: Option<Duration>,
+}
+
+fn structured_retry_hint(body: &[u8]) -> StructuredRetryHint {
+    fn visit(value: &Value, retry_info: bool, hint: &mut StructuredRetryHint) {
+        match value {
+            Value::Object(object) => {
+                let is_retry_info = retry_info
+                    || object
+                        .get("@type")
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| value.ends_with("google.rpc.RetryInfo"));
+                if is_retry_info {
+                    hint.explicit = true;
+                }
+
+                for (key, value) in object {
+                    let key = key.to_ascii_lowercase().replace(['_', '-'], "");
+                    if key == "retryinfo" {
+                        hint.explicit = true;
+                    } else if matches!(key.as_str(), "retrydelay" | "retryafter") {
+                        hint.explicit = true;
+                        if hint.delay.is_none() {
+                            hint.delay = parse_retry_delay(value);
+                        }
+                    }
+                    visit(value, is_retry_info, hint);
+                }
+            }
+            Value::Array(values) => {
+                for value in values {
+                    visit(value, retry_info, hint);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut hint = StructuredRetryHint::default();
+    if let Ok(value) = serde_json::from_slice::<Value>(body) {
+        visit(&value, false, &mut hint);
+    }
+    hint
+}
+
+fn parse_retry_delay(value: &Value) -> Option<Duration> {
+    let seconds = match value {
+        Value::Number(number) => number.as_f64()?,
+        Value::String(value) => {
+            let value = value.trim();
+            if let Some(value) = value.strip_suffix("ms") {
+                value.parse::<f64>().ok()? / 1_000.0
+            } else if let Some(value) = value.strip_suffix('s') {
+                value.parse::<f64>().ok()?
+            } else {
+                value.parse::<f64>().ok()?
+            }
+        }
+        _ => return None,
+    };
+    if !seconds.is_finite() || !(0.0..=MAX_CONFIGURED_DURATION_SECS as f64).contains(&seconds) {
+        return None;
+    }
+    Some(Duration::from_secs_f64(seconds))
+}
+
+fn contains_text_retry_hint(body: &[u8]) -> bool {
     let text = String::from_utf8_lossy(body).to_ascii_lowercase();
-    let retry_hint = has_retry_after
-        || [
-            "retryinfo",
-            "retry_after",
-            "retry-after",
-            "rate_limit",
-            "rate limit",
-            "perminute",
-            "per_minute",
-            "per minute",
-            "per second",
-            "per-second",
-            "requests per minute",
-        ]
-        .iter()
-        .any(|value| text.contains(value));
+    [
+        "retryinfo",
+        "retry_after",
+        "retry-after",
+        "retry after",
+        "retry in",
+        "try again",
+        "rate_limit",
+        "rate limit",
+        "perminute",
+        "per_minute",
+        "per minute",
+        "per second",
+        "per-second",
+        "requests per minute",
+    ]
+    .iter()
+    .any(|value| text.contains(value))
+}
+
+fn permanent_failure(body: &[u8], has_retry_hint: bool) -> Option<&'static str> {
+    let text = String::from_utf8_lossy(body).to_ascii_lowercase();
 
     let permanent = [
         "insufficient_quota",
@@ -251,8 +404,6 @@ fn permanent_failure(body: &[u8], has_retry_after: bool) -> Option<&'static str>
         );
     }
 
-    // These provider error codes are ambiguous on their own: rate/quota
-    // windows can recover, while exhausted account quotas cannot.
     let ambiguous_quota = [
         "servicequotaexceeded",
         "quotaexceededexception",
@@ -263,49 +414,302 @@ fn permanent_failure(body: &[u8], has_retry_after: bool) -> Option<&'static str>
     .iter()
     .any(|value| text.contains(value));
 
-    if ambiguous_quota && !retry_hint {
+    if ambiguous_quota && !has_retry_hint {
         Some("The provider reports an exhausted quota; check its quota limits or billing settings")
     } else {
         None
     }
 }
 
-fn response_error_message(status: StatusCode, body: &[u8]) -> String {
-    let data: serde_json::Value = match serde_json::from_slice(body) {
-        Ok(data) => data,
-        Err(_) => return format!("Provider returned HTTP {}", status.as_u16()),
+fn response_error_message(status: StatusCode, body: &ResponseBody) -> String {
+    let body_text = response_body_text(body);
+    let mut diagnostic = match serde_json::from_slice::<Value>(&body.bytes) {
+        Ok(mut data) => {
+            redact_json_secrets(&mut data);
+            let message = first_string(
+                &data,
+                &[
+                    "/error/message",
+                    "/message",
+                    "/detail",
+                    "/error",
+                    "/errors/0/message",
+                    "/errors/0/title",
+                    "/Message",
+                    "/Error/Message",
+                    "/title",
+                ],
+            );
+            let code = first_string(
+                &data,
+                &[
+                    "/error/type",
+                    "/error/code",
+                    "/error/status",
+                    "/code",
+                    "/status",
+                    "/__type",
+                    "/type",
+                    "/errors/0/code",
+                    "/errors/0/reason",
+                ],
+            );
+            let details = first_value(
+                &data,
+                &[
+                    "/error/details",
+                    "/details",
+                    "/error/innererror",
+                    "/error/inner_error",
+                    "/errors",
+                ],
+            );
+
+            let mut parts = Vec::new();
+            if let Some(message) = message {
+                parts.push(message);
+            }
+            if let Some(code) = code {
+                parts.push(format!("code: {code}"));
+            }
+            if let Some(details) = details {
+                if let Ok(details) = serde_json::to_string(details) {
+                    parts.push(format!("details: {details}"));
+                }
+            }
+            if parts.is_empty() {
+                serde_json::to_string(&data).unwrap_or(body_text)
+            } else {
+                parts.join("; ")
+            }
+        }
+        Err(_) if body_text.trim().is_empty() => "empty response body".to_string(),
+        Err(_) => body_text,
     };
 
-    let message = data
-        .pointer("/error/message")
-        .and_then(serde_json::Value::as_str)
-        .or_else(|| data.pointer("/message").and_then(serde_json::Value::as_str))
-        .or_else(|| data.pointer("/detail").and_then(serde_json::Value::as_str))
-        .or_else(|| data.pointer("/error").and_then(serde_json::Value::as_str))
-        .unwrap_or("provider request failed");
-    let code = data
-        .pointer("/error/type")
-        .and_then(serde_json::Value::as_str)
-        .or_else(|| {
-            data.pointer("/error/code")
-                .and_then(serde_json::Value::as_str)
-        })
-        .or_else(|| data.pointer("/code").and_then(serde_json::Value::as_str));
-    let message: String = message
-        .chars()
-        .filter(|value| !value.is_control())
-        .take(300)
-        .collect();
-
-    match code {
-        Some(code) => format!(
-            "Provider returned HTTP {}: {} (code: {})",
-            status.as_u16(),
-            message,
-            code
-        ),
-        None => format!("Provider returned HTTP {}: {}", status.as_u16(), message),
+    if body.truncated {
+        diagnostic.push_str(&format!(
+            " [response body truncated after {MAX_ERROR_RESPONSE_BYTES} bytes]"
+        ));
     }
+    format!("Provider returned HTTP {}: {diagnostic}", status.as_u16())
+}
+
+fn first_string(value: &Value, paths: &[&str]) -> Option<String> {
+    paths.iter().find_map(|path| {
+        let value = value.pointer(path)?;
+        match value {
+            Value::String(value) if !value.trim().is_empty() => Some(value.clone()),
+            Value::Number(value) => Some(value.to_string()),
+            _ => None,
+        }
+    })
+}
+
+fn first_value<'a>(value: &'a Value, paths: &[&str]) -> Option<&'a Value> {
+    paths.iter().find_map(|path| value.pointer(path))
+}
+
+fn redact_json_secrets(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            for (key, value) in object.iter_mut() {
+                let key = key
+                    .chars()
+                    .filter(|value| value.is_ascii_alphanumeric())
+                    .flat_map(char::to_lowercase)
+                    .collect::<String>();
+                let sensitive = matches!(
+                    key.as_str(),
+                    "key"
+                        | "apikey"
+                        | "authorization"
+                        | "token"
+                        | "accesstoken"
+                        | "refreshtoken"
+                        | "clientsecret"
+                        | "password"
+                        | "secret"
+                        | "credential"
+                        | "privatekey"
+                ) || key.ends_with("apikey")
+                    || key.ends_with("token")
+                    || key.ends_with("secret")
+                    || key.ends_with("password");
+                if sensitive {
+                    *value = Value::String("[REDACTED]".to_string());
+                } else {
+                    redact_json_secrets(value);
+                }
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                redact_json_secrets(value);
+            }
+        }
+        Value::String(value) => *value = redact_secret_text(value),
+        _ => {}
+    }
+}
+
+fn redact_secret_text(value: &str) -> String {
+    let mut value = redact_assignment_values(value);
+    value = redact_auth_scheme(&value, "bearer");
+    value = redact_auth_scheme(&value, "basic");
+    for prefix in ["sk-", "AIza", "AKIA", "xoxb-", "xoxp-", "xoxa-"] {
+        value = redact_prefixed_token(&value, prefix);
+    }
+    value
+}
+
+fn redact_assignment_values(input: &str) -> String {
+    const MARKERS: &[&str] = &[
+        "authorization",
+        "access_token",
+        "access-token",
+        "refresh_token",
+        "client_secret",
+        "private_key",
+        "api_key",
+        "api-key",
+        "apikey",
+        "password",
+        "credential",
+        "secret",
+        "token",
+        "key",
+    ];
+    let mut value = input.to_string();
+    let mut cursor = 0;
+
+    loop {
+        let lower = value.to_ascii_lowercase();
+        let found = MARKERS
+            .iter()
+            .filter_map(|marker| {
+                lower[cursor..]
+                    .find(marker)
+                    .map(|offset| (cursor + offset, *marker))
+            })
+            .min_by_key(|(index, _)| *index);
+        let Some((start, marker)) = found else {
+            break;
+        };
+
+        let mut position = start + marker.len();
+        while position < value.len()
+            && (value.as_bytes()[position].is_ascii_whitespace()
+                || matches!(value.as_bytes()[position], b'"' | b'\''))
+        {
+            position += 1;
+        }
+        if position >= value.len() || !matches!(value.as_bytes()[position], b':' | b'=') {
+            cursor = start + marker.len();
+            continue;
+        }
+        position += 1;
+        while position < value.len()
+            && (value.as_bytes()[position].is_ascii_whitespace()
+                || matches!(value.as_bytes()[position], b'"' | b'\''))
+        {
+            position += 1;
+        }
+        let value_start = position;
+        let quote = value.as_bytes().get(value_start.wrapping_sub(1)).copied();
+        let value_end = if matches!(quote, Some(b'"' | b'\'')) {
+            value[value_start..]
+                .as_bytes()
+                .iter()
+                .position(|byte| *byte == quote.unwrap())
+                .map(|offset| value_start + offset)
+                .unwrap_or(value.len())
+        } else {
+            value[value_start..]
+                .as_bytes()
+                .iter()
+                .position(|byte| {
+                    byte.is_ascii_whitespace()
+                        || matches!(*byte, b',' | b';' | b'&' | b'}' | b']')
+                })
+                .map(|offset| value_start + offset)
+                .unwrap_or(value.len())
+        };
+
+        if value_end > value_start {
+            value.replace_range(value_start..value_end, "[REDACTED]");
+            cursor = value_start + "[REDACTED]".len();
+        } else {
+            cursor = start + marker.len();
+        }
+    }
+
+    value
+}
+
+fn redact_auth_scheme(input: &str, scheme: &str) -> String {
+    let mut value = input.to_string();
+    let mut cursor = 0;
+    loop {
+        let lower = value.to_ascii_lowercase();
+        let Some(offset) = lower[cursor..].find(scheme) else {
+            break;
+        };
+        let start = cursor + offset;
+        let after_scheme = start + scheme.len();
+        if start > 0 && value.as_bytes()[start - 1].is_ascii_alphanumeric() {
+            cursor = after_scheme;
+            continue;
+        }
+        let mut token_start = after_scheme;
+        while token_start < value.len() && value.as_bytes()[token_start].is_ascii_whitespace() {
+            token_start += 1;
+        }
+        let token_end = value[token_start..]
+            .as_bytes()
+            .iter()
+            .position(|byte| {
+                byte.is_ascii_whitespace()
+                    || matches!(*byte, b'"' | b'\'' | b',' | b';' | b'}' | b']')
+            })
+            .map(|offset| token_start + offset)
+            .unwrap_or(value.len());
+        if token_end > token_start {
+            value.replace_range(token_start..token_end, "[REDACTED]");
+            cursor = token_start + "[REDACTED]".len();
+        } else {
+            cursor = after_scheme;
+        }
+    }
+    value
+}
+
+fn redact_prefixed_token(input: &str, prefix: &str) -> String {
+    let mut value = input.to_string();
+    let mut cursor = 0;
+    loop {
+        let lower = value.to_ascii_lowercase();
+        let Some(offset) = lower[cursor..].find(&prefix.to_ascii_lowercase()) else {
+            break;
+        };
+        let start = cursor + offset;
+        let token_end = value[start..]
+            .as_bytes()
+            .iter()
+            .position(|byte| {
+                !(byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b'_' | b'.'))
+            })
+            .map(|offset| start + offset)
+            .unwrap_or(value.len());
+        let boundary = start == 0 || !value.as_bytes()[start - 1].is_ascii_alphanumeric();
+        if boundary && token_end.saturating_sub(start) >= 20 {
+            value.replace_range(start..token_end, "[REDACTED]");
+            cursor = start + "[REDACTED]".len();
+        } else {
+            cursor = start + prefix.len();
+        }
+    }
+    value
 }
 
 #[cfg(test)]

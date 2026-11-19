@@ -1,5 +1,8 @@
-use super::retry::{is_retryable_status, RetryPolicy, RetryState};
-use super::{catch_error, ToolCall};
+use super::retry::{
+    format_response_error, read_response_body, response_body_text, is_retryable_status,
+    RetryPolicy, RetryState,
+};
+use super::ToolCall;
 use crate::utils::AbortSignal;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -143,22 +146,8 @@ where
                 }
                 Err(EventSourceError::InvalidStatusCode(status, response)) => {
                     let headers = response.headers().clone();
-                    let body = response.text().await?;
-                    if is_retryable_status(status) {
-                        retry_delay =
-                            Some(retry_state.retry_response(status, &headers, body.as_bytes())?);
-                    } else {
-                        let data: Value = match body.parse() {
-                            Ok(data) => data,
-                            Err(_) => {
-                                bail!(
-                                    "Invalid response data: {body} (status: {})",
-                                    status.as_u16()
-                                );
-                            }
-                        };
-                        catch_error(&data, status.as_u16())?;
-                    }
+                    let body = read_response_body(response).await?;
+                    retry_delay = Some(retry_state.retry_response(status, &headers, &body, true)?);
                     es.close();
                     break;
                 }
@@ -168,10 +157,13 @@ where
                     break;
                 }
                 Err(EventSourceError::InvalidContentType(header_value, response)) => {
-                    let text = response.text().await?;
+                    let status = response.status();
+                    let body = read_response_body(response).await?;
                     bail!(
-                        "Invalid response event-stream. content-type: {}, data: {text}",
-                        header_value.to_str().unwrap_or_default()
+                        "Invalid response event-stream. HTTP {} content-type: {}, data: {}",
+                        status.as_u16(),
+                        header_value.to_str().unwrap_or_default(),
+                        response_body_text(&body)
                     );
                 }
                 Err(EventSourceError::Transport(err)) => {
@@ -205,18 +197,8 @@ where
         .await?;
     let status = response.status();
     if status != reqwest::StatusCode::OK {
-        let body = response.text().await?;
-        let data: Value = match body.parse() {
-            Ok(data) => data,
-            Err(_) => {
-                bail!(
-                    "Invalid response data: {body} (status: {})",
-                    status.as_u16()
-                );
-            }
-        };
-        catch_error(&data, status.as_u16())?;
-        return Ok(());
+        let body = read_response_body(response).await?;
+        bail!("{}", format_response_error(status, &body));
     }
 
     let content_type = response
@@ -230,8 +212,13 @@ where
         .next()
         .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"))
     {
-        let body = response.text().await?;
-        bail!("Invalid response event-stream. content-type: {content_type}, data: {body}");
+        let status = response.status();
+        let body = read_response_body(response).await?;
+        bail!(
+            "Invalid response event-stream. HTTP {} content-type: {content_type}, data: {}",
+            status.as_u16(),
+            response_body_text(&body)
+        );
     }
 
     let mut events = response.bytes_stream().eventsource();
