@@ -562,8 +562,7 @@ async fn fetch_access_token(
     file: &Option<String>,
 ) -> Result<(String, i64)> {
     let credentials = load_adc(file).await?;
-    let value: Value = client
-        send_with_retry(
+    let value: Value = send_with_retry(
             client
                 .post("https://oauth2.googleapis.com/token")
                 .json(&credentials),
