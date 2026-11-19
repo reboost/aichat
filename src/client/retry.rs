@@ -495,10 +495,8 @@ fn response_error_message(status: StatusCode, body: &ResponseBody) -> String {
             );
             let oauth_error = first_string(&data, &["/error"]);
             let error_uri = first_string(&data, &["/error_uri", "/error/uri"]);
-            let error_hint = first_string(
-                &data,
-                &["/error_hint", "/error_reason", "/error_subtype"],
-            );
+            let error_hint =
+                first_string(&data, &["/error_hint", "/error_reason", "/error_subtype"]);
             let error_type = first_string(&data, &["/error/type", "/__type", "/type"]);
             let code = first_string(
                 &data,
@@ -1096,12 +1094,10 @@ mod tests {
                 MockResponse::json(200, r#"{"ok":true}"#),
             ])
             .await;
-            let error = send_with_retry_policy(
-                post(&reqwest::Client::new(), &url),
-                quick_policy(3),
-            )
-            .await
-            .unwrap_err();
+            let error =
+                send_with_retry_policy(post(&reqwest::Client::new(), &url), quick_policy(3))
+                    .await
+                    .unwrap_err();
 
             assert!(error.to_string().contains("HTTP 429"), "{error}");
             assert_eq!(
