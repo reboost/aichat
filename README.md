@@ -150,6 +150,17 @@ AIChat supports custom dark and light themes, which highlight response text and 
 
 ![aichat-themes](https://github.com/sigoden/aichat/assets/4012553/29fa8b79-031e-405d-9caa-70d24fa0acf8)
 
+## Provider HTTP recovery
+
+Provider requests automatically retry temporary rate limits and server overloads, including HTTP 429, 500, 502, 503, 504, and Anthropic-style 529 responses. Retries respect `Retry-After`, use exponential backoff with jitter, and stop after a bounded number of attempts or the configured total duration. Permanent billing, quota, authentication, and invalid-request errors are returned without retrying.
+
+Retry limits can be adjusted with:
+
+- `AICHAT_HTTP_RETRY_MAX_ATTEMPTS`: total attempts, including the first request (default: `4`, range: `1–10`).
+- `AICHAT_HTTP_RETRY_MAX_DURATION_SECS`: maximum total retry duration (default: `30`, range: `0–300` seconds).
+
+Streaming requests are retried only before the stream is accepted. A request is not replayed after stream content begins, nor after an ambiguous request timeout that may have occurred after provider submission.
+
 ## Documentation
 
 - [Chat-REPL Guide](https://github.com/sigoden/aichat/wiki/Chat-REPL-Guide)

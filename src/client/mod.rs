@@ -1,6 +1,7 @@
 mod access_token;
 mod common;
 mod message;
+mod retry;
 #[macro_use]
 mod macros;
 mod model;
@@ -10,6 +11,7 @@ pub use crate::function::ToolCall;
 pub use common::*;
 pub use message::*;
 pub use model::*;
+pub(crate) use retry::send_with_retry;
 pub use stream::*;
 
 register_client!(

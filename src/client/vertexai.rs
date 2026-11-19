@@ -184,7 +184,7 @@ pub async fn gemini_chat_completions(
     builder: RequestBuilder,
     _model: &Model,
 ) -> Result<ChatCompletionsOutput> {
-    let res = builder.send().await?;
+    let res = send_with_retry(builder).await?;
     let status = res.status();
     let data: Value = res.json().await?;
     if !status.is_success() {
@@ -199,7 +199,7 @@ pub async fn gemini_chat_completions_streaming(
     handler: &mut SseHandler,
     _model: &Model,
 ) -> Result<()> {
-    let res = builder.send().await?;
+    let res = send_with_retry(builder).await?;
     let status = res.status();
     if !status.is_success() {
         let data: Value = res.json().await?;
@@ -267,7 +267,7 @@ fn gemini_function_call_part(call: &ToolCall) -> Value {
 }
 
 async fn embeddings(builder: RequestBuilder, _model: &Model) -> Result<EmbeddingsOutput> {
-    let res = builder.send().await?;
+    let res = send_with_retry(builder).await?;
     let status = res.status();
     let data: Value = res.json().await?;
     if !status.is_success() {
@@ -562,10 +562,11 @@ async fn fetch_access_token(
     file: &Option<String>,
 ) -> Result<(String, i64)> {
     let credentials = load_adc(file).await?;
-    let value: Value = client
-        .post("https://oauth2.googleapis.com/token")
-        .json(&credentials)
-        .send()
+    let value: Value = send_with_retry(
+            client
+                .post("https://oauth2.googleapis.com/token")
+                .json(&credentials),
+        )
         .await?
         .json()
         .await?;
