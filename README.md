@@ -152,7 +152,7 @@ AIChat supports custom dark and light themes, which highlight response text and 
 
 ## Provider HTTP recovery
 
-Provider HTTP recovery is shared across providers. HTTP 429, 500, 502, 503, 504, and Anthropic-style 529 responses are retryable by default. Verified permanent billing, usage-limit, and authentication error codes, plus known structured Gemini daily-quota identifiers, are returned immediately; ordinary quota wording alone does not make a response permanent.
+Provider HTTP recovery is shared across providers. HTTP 408, 425, 429, 500, 502, 503, 504, and Anthropic-style 529 responses are retryable by default. Verified permanent billing, usage-limit, and authentication error codes, plus known structured Gemini daily-quota identifiers, are returned immediately; ordinary quota wording alone does not make a response permanent.
 
 Retries use bounded exponential backoff with jitter. The client honors the longer of the HTTP `Retry-After` header (delta-seconds or HTTP-date) and a documented, explicitly typed Google `google.rpc.RetryInfo.retryDelay`, then applies the backoff as a minimum. Google retry details are read only from the standard error details array or a top-level array of typed details. Unrelated JSON fields are not interpreted as retry instructions. A malformed recognized Google retry delay is reported and never replaced with a shorter fallback.
 
@@ -163,7 +163,7 @@ Retry limits can be adjusted with:
 
 A provider-requested delay is never shortened to fit the elapsed-time budget; recovery stops with the provider diagnostic when the full delay cannot fit. Connection-establishment failures may be retried for cloneable requests, but ambiguous request timeouts are not replayed. Non-cloneable requests are sent only once.
 
-SSE handshakes may retry only before the stream opens. Once the stream is open, or a successful streaming response has been handed to the caller, the request is never replayed after partial output. Request cloneability does not guarantee operation idempotency: retrying server errors such as 500 or 503 can duplicate provider work or billing if the provider processed the operation before returning the error. The shared helper does not provide exactly-once execution.
+SSE handshakes may retry only before the stream opens. Once the stream is open, or a successful streaming response has been handed to the caller, the request is never replayed after partial output. Request cloneability does not guarantee operation idempotency: retrying a request after a retryable HTTP response (including 408, 425, and server errors) can duplicate provider work or billing if the provider processed the operation before returning the response. The shared helper does not provide exactly-once execution.
 
 ## Documentation
 
