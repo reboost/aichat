@@ -943,6 +943,14 @@ mod tests {
         let diagnostic = format_response_error(StatusCode::BAD_GATEWAY, &body);
         assert!(diagnostic.contains("HTTP 502"));
         assert!(diagnostic.contains("gateway said unavailable"));
+
+        let raw_json = b"{\n  \"error\": {\n    \"message\": \"provider detail\",\n    \"code\": \"rate_limit_exceeded\"\n  }\n}";
+        let body = ResponseBody {
+            bytes: raw_json.to_vec(),
+            truncated: false,
+        };
+        let diagnostic = format_response_error(StatusCode::TOO_MANY_REQUESTS, &body);
+        assert!(diagnostic.contains(std::str::from_utf8(raw_json).unwrap()));
     }
 
     #[test]
@@ -972,7 +980,7 @@ mod tests {
     #[test]
     fn redacts_credentials_from_json_and_unparsed_error_bodies() {
         let json_body = ResponseBody {
-            bytes: br#"{"service":{"api_key":"json-secret-key","refresh_token":"refresh-secret","note":"Authorization: Bearer header-secret"}}"#.to_vec(),
+            bytes: br#"{"service":{"api_key":"json-secret-key","refresh_token":"refresh-secret","note":"Authorization: Bearer header-secret","key":"provider-diagnostic-key","request_id":"request-123"}}"#.to_vec(),
             truncated: false,
         };
         let diagnostic = format_response_error(StatusCode::BAD_REQUEST, &json_body);
@@ -980,6 +988,8 @@ mod tests {
             assert!(!diagnostic.contains(secret), "{diagnostic}");
         }
         assert!(diagnostic.contains("[REDACTED]"));
+        assert!(diagnostic.contains("provider-diagnostic-key"));
+        assert!(diagnostic.contains("request-123"));
 
         let raw_body = ResponseBody {
             bytes: b"upstream echoed Authorization: Bearer plain-secret-token, api_key=other-secret, API key: freeform-secret"
@@ -990,6 +1000,13 @@ mod tests {
         for secret in ["plain-secret-token", "other-secret", "freeform-secret"] {
             assert!(!diagnostic.contains(secret), "{diagnostic}");
         }
+
+        let truncated = ResponseBody {
+            bytes: vec![b'x'; MAX_ERROR_RESPONSE_BYTES],
+            truncated: true,
+        };
+        let diagnostic = format_response_error(StatusCode::BAD_GATEWAY, &truncated);
+        assert!(diagnostic.contains("response body truncated after 65536 bytes"));
     }
 
     #[tokio::test]
@@ -1273,7 +1290,7 @@ mod tests {
 
     #[test]
     fn array_wrapped_gemini_daily_quota_remains_permanent() {
-        let body = br#"[{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{"quotaId":"GenerateRequestsPerDayPerProjectPerModel-FreeTier"}]},{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"59s"}]}}]"#;
+        let body = br#"[{"error":{"code":429,"message":"Daily requests quota exhausted","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{"quotaId":"GenerateRequestsPerDayPerProjectPerModel-FreeTier","description":"daily request cap reached"}]},{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"59s"}]}}]"#;
         let data: Value = serde_json::from_slice(body).unwrap();
 
         assert!(google_has_daily_quota(&data));
@@ -1293,7 +1310,11 @@ mod tests {
             )
             .unwrap_err();
 
-        assert!(error.to_string().contains("daily quota"));
+        let diagnostic = error.to_string();
+        assert!(diagnostic.contains("daily quota"));
+        assert!(diagnostic.contains("Daily requests quota exhausted"));
+        assert!(diagnostic.contains("GenerateRequestsPerDayPerProjectPerModel-FreeTier"));
+        assert!(diagnostic.contains("daily request cap reached"));
         assert_eq!(state.attempt, 1);
     }
 
@@ -1443,7 +1464,7 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_google_retry_info_never_falls_back_to_a_shorter_delay() {
-        let body = r#"{"error":{"message":"Rate limited","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"later"}]}}"#;
+        let body = r#"{"error":{"code":"rate_limit_exceeded","message":"Rate limited","request_id":"malformed-retry-123","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"later"},{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{"quotaId":"GenerateRequestsPerMinutePerProjectPerModel-FreeTier"}]}]}}"#;
         let (url, requests, server) = spawn_server(vec![
             MockResponse::json(429, body).header("Retry-After", "0"),
             MockResponse::json(200, r#"{"ok":true}"#),
@@ -1457,6 +1478,9 @@ mod tests {
         assert!(error.contains("HTTP 429"), "{error}");
         assert!(error.contains("malformed retryDelay"), "{error}");
         assert!(error.contains(r#""retryDelay":"later""#), "{error}");
+        assert!(error.contains("rate_limit_exceeded"), "{error}");
+        assert!(error.contains("malformed-retry-123"), "{error}");
+        assert!(error.contains("GenerateRequestsPerMinutePerProjectPerModel-FreeTier"), "{error}");
         assert_eq!(requests.load(Ordering::SeqCst), 1);
         server.abort();
     }
@@ -1665,4 +1689,102 @@ mod tests {
         assert_eq!(requests.load(Ordering::SeqCst), 1);
         server.await.unwrap();
     }
+    #[test]
+    fn retry_admission_budget_preserves_a_provider_requested_three_second_wait() {
+        let body = ResponseBody {
+            bytes: br#"{"error":{"code":"rate_limit_exceeded","message":"provider rate limit","details":[{"request_id":"budget-error-123"}]}}"#.to_vec(),
+            truncated: false,
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_AFTER, "3".parse().unwrap());
+        let mut policy = quick_policy(4);
+        policy.max_duration = Duration::from_millis(100);
+        let mut state = RetryState::new(policy);
+        let error = state
+            .retry_response(StatusCode::TOO_MANY_REQUESTS, &headers, &body, true)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("next wait (3.00s)"), "{error}");
+        assert!(error.contains("remaining retry admission budget"), "{error}");
+        assert!(error.contains("provider rate limit"), "{error}");
+        assert!(error.contains("rate_limit_exceeded"), "{error}");
+        assert!(error.contains("budget-error-123"), "{error}");
+        assert_eq!(state.attempt, 1);
+    }
+
+    #[tokio::test]
+    async fn preserves_latest_provider_response_when_attempts_are_exhausted() {
+        let first = r#"{"error":{"message":"first provider response"}}"#;
+        let latest = r#"{"error":{"code":"rate_limit_exceeded","message":"latest provider response","details":[{"request_id":"latest-request-456","quota":"per-minute"}]}}"#;
+        let (url, requests, server) = spawn_server(vec![
+            MockResponse::json(429, first).header("Retry-After", "0"),
+            MockResponse::json(429, latest).header("Retry-After", "0"),
+        ])
+        .await;
+        let error = send_with_retry_policy(post(&reqwest::Client::new(), &url), quick_policy(2))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("HTTP 429"), "{error}");
+        assert!(error.contains("latest provider response"), "{error}");
+        assert!(error.contains("rate_limit_exceeded"), "{error}");
+        assert!(error.contains("latest-request-456"), "{error}");
+        assert!(error.contains("per-minute"), "{error}");
+        assert!(error.contains("HTTP recovery exhausted after 2 attempts"), "{error}");
+        assert!(!error.contains("first provider response"), "{error}");
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn preserves_provider_response_when_a_retry_fails_at_transport_layer() {
+        let body = r#"{"error":{"code":"rate_limit_exceeded","message":"provider asked us to retry","details":[{"request_id":"transport-followup-789","quota":"minute-limit"}]}}"#;
+        let (url, requests, server) = spawn_server(vec![
+            MockResponse::json(429, body).header("Retry-After", "0"),
+        ])
+        .await;
+        let error = send_with_retry_policy(post(&reqwest::Client::new(), &url), quick_policy(2))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("HTTP 429"), "{error}");
+        assert!(error.contains("provider asked us to retry"), "{error}");
+        assert!(error.contains("rate_limit_exceeded"), "{error}");
+        assert!(error.contains("transport-followup-789"), "{error}");
+        assert!(error.contains("minute-limit"), "{error}");
+        assert!(error.contains("Connection failure before a provider HTTP response was received"), "{error}");
+        assert!(error.contains("HTTP recovery exhausted after 2 attempts"), "{error}");
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sse_handshake_failure_preserves_provider_response_and_transport_error() {
+        let body = r#"{"error":{"code":"overloaded_error","message":"stream handshake rejected","details":[{"request_id":"sse-handshake-321","reason":"upstream busy"}]}}"#;
+        let (url, requests, server) = spawn_server(vec![
+            MockResponse::json(503, body).header("Retry-After", "0"),
+        ])
+        .await;
+        let error = super::super::stream::sse_stream_with_policy(
+            post(&reqwest::Client::new(), &url),
+            |_| Ok(false),
+            quick_policy(2),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("HTTP 503"), "{error}");
+        assert!(error.contains("stream handshake rejected"), "{error}");
+        assert!(error.contains("overloaded_error"), "{error}");
+        assert!(error.contains("sse-handshake-321"), "{error}");
+        assert!(error.contains("upstream busy"), "{error}");
+        assert!(error.contains("Connection failure before a provider HTTP response was received"), "{error}");
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        server.await.unwrap();
+    }
+
 }
