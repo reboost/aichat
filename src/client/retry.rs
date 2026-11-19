@@ -2198,5 +2198,4 @@ mod tests {
         assert_eq!(requests.load(Ordering::SeqCst), 1);
         server.await.unwrap();
     }
-
 }
