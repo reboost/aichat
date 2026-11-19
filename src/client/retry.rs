@@ -15,6 +15,7 @@ const MAX_CONFIGURED_DURATION_SECS: u64 = 300;
 const BASE_DELAY_MS: u64 = 250;
 const MAX_BACKOFF_MS: u64 = 8_000;
 const MAX_ERROR_RESPONSE_BYTES: usize = 64 * 1024;
+const MAX_ERROR_DIAGNOSTIC_BYTES: usize = MAX_ERROR_RESPONSE_BYTES + 512;
 
 #[derive(Clone, Copy)]
 pub(super) struct RetryPolicy {
@@ -122,7 +123,7 @@ impl RetryState {
         let retry_after = header_retry_after.or(structured_hint.delay);
         let has_retry_signal = header_retry_after.is_some()
             || structured_hint.explicit
-            || contains_text_retry_hint(&body.bytes);
+            || contains_transient_rate_limit_hint(&body.bytes);
 
         if let Some(reason) = permanent_failure(&body.bytes, has_retry_signal) {
             anyhow::bail!("{diagnostic}. {reason}");
@@ -363,15 +364,9 @@ fn parse_retry_delay(value: &Value) -> Option<Duration> {
     ))
 }
 
-fn contains_text_retry_hint(body: &[u8]) -> bool {
+fn contains_transient_rate_limit_hint(body: &[u8]) -> bool {
     let text = String::from_utf8_lossy(body).to_ascii_lowercase();
     [
-        "retryinfo",
-        "retry_after",
-        "retry-after",
-        "retry after",
-        "retry in",
-        "try again",
         "rate_limit",
         "rate limit",
         "perminute",
@@ -387,7 +382,7 @@ fn contains_text_retry_hint(body: &[u8]) -> bool {
 
 fn permanent_failure(body: &[u8], has_retry_hint: bool) -> Option<&'static str> {
     let text = String::from_utf8_lossy(body).to_ascii_lowercase();
-    let has_retry_hint = has_retry_hint || contains_text_retry_hint(body);
+    let has_retry_hint = has_retry_hint || contains_transient_rate_limit_hint(body);
 
     let permanent = [
         "insufficient_quota",
@@ -435,6 +430,23 @@ fn permanent_failure(body: &[u8], has_retry_hint: bool) -> Option<&'static str> 
         "monthly limit reached",
         "per-day quota exhausted",
         "per-month quota exhausted",
+        "daily quota",
+        "monthly quota",
+        "daily limit",
+        "monthly limit",
+        "per-day limit",
+        "per-month limit",
+        "per day quota",
+        "per month quota",
+        "quota per day",
+        "quota per month",
+        "quota for today",
+        "quota for this day",
+        "quota for this month",
+        "daily allowance",
+        "monthly allowance",
+        "daily usage limit",
+        "monthly usage limit",
     ]
     .iter()
     .any(|value| text.contains(value));
@@ -451,10 +463,6 @@ fn permanent_failure(body: &[u8], has_retry_hint: bool) -> Option<&'static str> 
         "quota exceeded",
         "quota has been exceeded",
         "exceeded your current quota",
-        "daily quota",
-        "monthly quota",
-        "daily limit",
-        "monthly limit",
     ]
     .iter()
     .any(|value| text.contains(value));
@@ -474,16 +482,22 @@ fn response_error_message(status: StatusCode, body: &ResponseBody) -> String {
             let message = first_string(
                 &data,
                 &[
+                    "/error_description",
                     "/error/message",
                     "/message",
                     "/detail",
-                    "/error",
                     "/errors/0/message",
                     "/errors/0/title",
                     "/Message",
                     "/Error/Message",
                     "/title",
                 ],
+            );
+            let oauth_error = first_string(&data, &["/error"]);
+            let error_uri = first_string(&data, &["/error_uri", "/error/uri"]);
+            let error_hint = first_string(
+                &data,
+                &["/error_hint", "/error_reason", "/error_subtype"],
             );
             let error_type = first_string(&data, &["/error/type", "/__type", "/type"]);
             let code = first_string(
@@ -506,6 +520,15 @@ fn response_error_message(status: StatusCode, body: &ResponseBody) -> String {
             if let Some(message) = message {
                 parts.push(message);
             }
+            if let Some(oauth_error) = oauth_error {
+                parts.push(format!("error: {oauth_error}"));
+            }
+            if let Some(error_uri) = error_uri {
+                parts.push(format!("error_uri: {error_uri}"));
+            }
+            if let Some(error_hint) = error_hint {
+                parts.push(format!("error hint: {error_hint}"));
+            }
             if let Some(error_type) = error_type {
                 parts.push(format!("type: {error_type}"));
             }
@@ -520,9 +543,12 @@ fn response_error_message(status: StatusCode, body: &ResponseBody) -> String {
                     parts.push(format!("details: {details}"));
                 }
             }
+
+            let response = serde_json::to_string(&data).unwrap_or_else(|_| body_text.clone());
             if parts.is_empty() {
-                serde_json::to_string(&data).unwrap_or(body_text)
+                response
             } else {
+                parts.push(format!("response: {response}"));
                 parts.join("; ")
             }
         }
@@ -535,7 +561,16 @@ fn response_error_message(status: StatusCode, body: &ResponseBody) -> String {
             " [response body truncated after {MAX_ERROR_RESPONSE_BYTES} bytes]"
         ));
     }
-    format!("Provider returned HTTP {}: {diagnostic}", status.as_u16())
+    let mut diagnostic = format!("Provider returned HTTP {}: {diagnostic}", status.as_u16());
+    if diagnostic.len() > MAX_ERROR_DIAGNOSTIC_BYTES {
+        let mut end = MAX_ERROR_DIAGNOSTIC_BYTES;
+        while !diagnostic.is_char_boundary(end) {
+            end -= 1;
+        }
+        diagnostic.truncate(end);
+        diagnostic.push_str(" [diagnostic truncated]");
+    }
+    diagnostic
 }
 
 fn first_string(value: &Value, paths: &[&str]) -> Option<String> {
@@ -1002,6 +1037,30 @@ mod tests {
     }
 
     #[test]
+    fn preserves_google_oauth_error_description_uri_and_other_fields() {
+        let body = ResponseBody {
+            bytes: br#"{"error":"invalid_grant","error_description":"The refresh token has expired or been revoked. Re-authorize the account.","error_uri":"https://developers.google.com/identity/protocols/oauth2","error_hint":"Reconnect the Google account","request_id":"oauth-request-123","provider_detail":"Contact support with this request ID","client_secret":"oauth-test-secret"}"#.to_vec(),
+            truncated: false,
+        };
+
+        let diagnostic = format_response_error(StatusCode::BAD_REQUEST, &body);
+        for value in [
+            "HTTP 400",
+            "invalid_grant",
+            "The refresh token has expired or been revoked. Re-authorize the account.",
+            "error_uri",
+            "https://developers.google.com/identity/protocols/oauth2",
+            "Reconnect the Google account",
+            "oauth-request-123",
+            "Contact support with this request ID",
+        ] {
+            assert!(diagnostic.contains(value), "{diagnostic} missing {value}");
+        }
+        assert!(!diagnostic.contains("oauth-test-secret"), "{diagnostic}");
+        assert!(diagnostic.contains("[REDACTED]"), "{diagnostic}");
+    }
+
+    #[test]
     fn redacts_credentials_from_json_and_unparsed_error_bodies() {
         let json_body = ResponseBody {
             bytes: br#"{"service":{"api_key":"json-secret-key","refresh_token":"refresh-secret","note":"Authorization: Bearer header-secret"}}"#.to_vec(),
@@ -1021,6 +1080,36 @@ mod tests {
         let diagnostic = format_response_error(StatusCode::BAD_GATEWAY, &raw_body);
         for secret in ["plain-secret-token", "other-secret", "freeform-secret"] {
             assert!(!diagnostic.contains(secret), "{diagnostic}");
+        }
+    }
+
+    #[tokio::test]
+    async fn does_not_retry_daily_or_monthly_quotas_with_generic_retry_wording() {
+        for body in [
+            r#"{"error":{"message":"You have exceeded your daily quota. Try again tomorrow."}}"#,
+            r#"{"error":{"message":"Daily quota has been exceeded. Retry in 24 hours."}}"#,
+            r#"{"error":{"message":"You have exceeded the quota for this month. Try again next month."}}"#,
+            r#"{"error":{"message":"Monthly limit exceeded. Please retry after renewal."}}"#,
+        ] {
+            let (url, requests, server) = spawn_server(vec![
+                MockResponse::json(429, body),
+                MockResponse::json(200, r#"{"ok":true}"#),
+            ])
+            .await;
+            let error = send_with_retry_policy(
+                post(&reqwest::Client::new(), &url),
+                quick_policy(3),
+            )
+            .await
+            .unwrap_err();
+
+            assert!(error.to_string().contains("HTTP 429"), "{error}");
+            assert_eq!(
+                requests.load(Ordering::SeqCst),
+                1,
+                "period quota response was retried: {body}"
+            );
+            server.await.unwrap();
         }
     }
 
@@ -1261,6 +1350,43 @@ mod tests {
         .is_some());
         assert!(
             permanent_failure(br#"{"error":{"code":"QuotaExceededException"}}"#, false).is_some()
+        );
+
+        for body in [
+            br#"{"error":{"message":"You have exceeded your daily quota. Try again tomorrow."}}"#.as_slice(),
+            br#"{"error":{"message":"Daily quota has been exceeded. Retry in 24 hours."}}"#.as_slice(),
+            br#"{"error":{"message":"You have exceeded the quota for this month. Try again next month."}}"#.as_slice(),
+            br#"{"error":{"message":"Monthly limit exceeded. Please retry after renewal."}}"#.as_slice(),
+        ] {
+            assert!(
+                permanent_failure(body, true).is_some(),
+                "period quota must remain permanent: {}",
+                String::from_utf8_lossy(body)
+            );
+        }
+        assert!(
+            permanent_failure(
+                br#"{"error":{"message":"Quota exceeded. Try again in 10 seconds."}}"#,
+                false
+            )
+            .is_some(),
+            "generic retry wording must not convert ambiguous quota exhaustion into a transient error"
+        );
+        assert!(
+            permanent_failure(
+                br#"{"error":{"message":"You exceeded your current quota","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"1s"}]}}"#,
+                true
+            )
+            .is_none(),
+            "structured RetryInfo must still allow a genuinely transient quota response"
+        );
+        assert!(
+            permanent_failure(
+                br#"{"error":{"message":"Quota exceeded per minute"}}"#,
+                false
+            )
+            .is_none(),
+            "rate-limit semantics must remain retryable"
         );
 
         let mut headers = HeaderMap::new();
