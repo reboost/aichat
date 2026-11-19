@@ -9,7 +9,7 @@ use serde_json::Value;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_MAX_ATTEMPTS: usize = 6;
-const DEFAULT_MAX_DURATION_SECS: u64 = 120;
+const DEFAULT_MAX_DURATION_SECS: u64 = 300;
 const MAX_CONFIGURED_ATTEMPTS: usize = 10;
 const MAX_CONFIGURED_DURATION_SECS: u64 = 300;
 const BASE_DELAY_MS: u64 = 250;
@@ -82,8 +82,13 @@ fn sanitized_body(body: &ResponseBody) -> String {
     let raw = String::from_utf8_lossy(&body.bytes);
     let text = match serde_json::from_slice::<Value>(&body.bytes) {
         Ok(mut data) => {
+            let original = data.clone();
             redact_json_secrets(&mut data);
-            serde_json::to_string(&data).unwrap_or_else(|_| redact_secret_text(&raw))
+            if data == original {
+                raw.to_string()
+            } else {
+                serde_json::to_string(&data).unwrap_or_else(|_| redact_secret_text(&raw))
+            }
         }
         Err(_) => redact_secret_text(&raw),
     };
@@ -132,6 +137,7 @@ pub(super) struct RetryState {
     started: Instant,
     attempt: usize,
     last_diagnostic: Option<String>,
+    last_transport_diagnostic: Option<String>,
 }
 
 impl RetryState {
@@ -141,6 +147,7 @@ impl RetryState {
             started: Instant::now(),
             attempt: 1,
             last_diagnostic: None,
+            last_transport_diagnostic: None,
         }
     }
 
@@ -151,34 +158,64 @@ impl RetryState {
         body: &ResponseBody,
         allow_retry: bool,
     ) -> Result<Duration> {
-        let diagnostic = response_error_message(status, body);
-        self.last_diagnostic = Some(diagnostic.clone());
+        self.last_diagnostic = Some(response_error_message(status, body));
+        self.last_transport_diagnostic = None;
 
         let required_delay = retry_delay(headers, &body.bytes)
-            .map_err(|reason| anyhow!("{diagnostic}; {reason}"))?;
+            .map_err(|reason| self.with_last_diagnostic(anyhow!(reason)))?;
 
         if let Some(reason) = permanent_failure(status, &body.bytes) {
-            anyhow::bail!("{diagnostic}. {reason}");
+            return Err(self.with_last_diagnostic(anyhow!(reason)));
         }
         if !allow_retry || !is_retryable_status(status) {
-            anyhow::bail!("{diagnostic}");
+            return Err(self.with_last_diagnostic(anyhow!(
+                "HTTP {} response was not retried",
+                status.as_u16()
+            )));
         }
 
         self.schedule(&format!("HTTP {}", status.as_u16()), required_delay)
             .map_err(|error| self.with_last_diagnostic(error))
     }
 
-    pub(super) fn retry_connection(&mut self) -> Result<Duration> {
+    pub(super) fn retry_connection(&mut self, error: &reqwest::Error) -> Result<Duration> {
+        self.last_transport_diagnostic = Some(format!(
+            "Connection failure before a provider HTTP response was received: {}",
+            error.without_url()
+        ));
         self.schedule("connection failure before request submission", None)
             .map_err(|error| self.with_last_diagnostic(error))
     }
 
+    pub(super) fn transport_error(
+        &mut self,
+        context: &str,
+        error: &reqwest::Error,
+    ) -> anyhow::Error {
+        self.last_transport_diagnostic =
+            Some(format!("{context}: {}", error.without_url()));
+        self.with_last_diagnostic(anyhow!(
+            "{}",
+            self.last_transport_diagnostic.as_deref().unwrap()
+        ))
+    }
+
     pub(super) fn with_last_diagnostic(&self, error: anyhow::Error) -> anyhow::Error {
-        match &self.last_diagnostic {
-            Some(diagnostic) if !error.to_string().contains(diagnostic) => {
-                anyhow!("{diagnostic}; {error}")
+        let message = error.to_string();
+        let mut diagnostics = Vec::new();
+        for diagnostic in [&self.last_diagnostic, &self.last_transport_diagnostic]
+            .into_iter()
+            .flatten()
+        {
+            if !message.contains(diagnostic) {
+                diagnostics.push(diagnostic.as_str());
             }
-            _ => error,
+        }
+        if diagnostics.is_empty() {
+            error
+        } else {
+            diagnostics.push(&message);
+            anyhow!(diagnostics.join("\n"))
         }
     }
 
@@ -193,12 +230,13 @@ impl RetryState {
         let delay = self
             .backoff_delay()
             .max(requested_delay.unwrap_or_default());
-        if self.started.elapsed().saturating_add(delay) > self.policy.max_duration {
+        let remaining = self.policy.max_duration.saturating_sub(self.started.elapsed());
+        if delay > remaining {
             anyhow::bail!(
-                "HTTP recovery stopped after {} attempts because the next delay ({:.2}s) exceeds the maximum retry duration ({:.2}s); {reason}",
+                "HTTP recovery stopped after {} attempts because the next wait ({:.2}s) does not fit the remaining retry admission budget ({:.2}s); {reason}",
                 self.attempt,
                 delay.as_secs_f64(),
-                self.policy.max_duration.as_secs_f64()
+                remaining.as_secs_f64()
             );
         }
 
@@ -254,19 +292,21 @@ async fn send_with_retry_policy(builder: RequestBuilder, policy: RetryPolicy) ->
         let response = match request.send().await {
             Ok(response) => response,
             Err(error) if allow_retry && error.is_connect() => {
-                let delay = state.retry_connection()?;
+                let delay = state.retry_connection(&error)?;
                 tokio::time::sleep(delay).await;
                 continue;
             }
             Err(error) if error.is_timeout() => {
-                let error = anyhow!(
-                    "Provider request timed out and was not replayed because the provider may have received it: {}",
-                    error.without_url()
-                );
-                return Err(state.with_last_diagnostic(error));
+                return Err(state.transport_error(
+                    "Provider request timed out; no HTTP response was received and the request was not replayed because the provider may have received it",
+                    &error,
+                ));
             }
             Err(error) => {
-                return Err(state.with_last_diagnostic(error.without_url().into()));
+                return Err(state.transport_error(
+                    "Transport failure; no provider HTTP response was received",
+                    &error,
+                ));
             }
         };
 
@@ -466,7 +506,7 @@ fn redact_json_secrets(value: &mut Value) {
                     .collect::<String>();
                 let sensitive = matches!(
                     key.as_str(),
-                    "key" | "apikey" | "authorization" | "token" | "credential"
+                    "apikey" | "authorization" | "token" | "credential"
                 ) || key.contains("apikey")
                     || key.contains("accesstoken")
                     || key.contains("accesskey")
@@ -501,7 +541,10 @@ fn redact_secret_text(value: &str) -> String {
     for prefix in ["sk-", "AIza", "AKIA", "xoxb-", "xoxp-", "xoxa-"] {
         value = redact_prefixed_token(&value, prefix);
     }
-    value.chars().filter(|value| !value.is_control()).collect()
+    value
+        .chars()
+        .filter(|value| !value.is_control() || matches!(*value, '\n' | '\r' | '\t'))
+        .collect()
 }
 
 fn redact_assignment_values(input: &str) -> String {
@@ -538,7 +581,6 @@ fn redact_assignment_values(input: &str) -> String {
         "credential",
         "secret",
         "token",
-        "key",
     ];
     let mut value = input.to_string();
     let mut cursor = 0;
@@ -1344,13 +1386,23 @@ mod tests {
     #[test]
     fn scheduler_accepts_google_delay_and_counts_total_attempts() {
         assert_eq!(DEFAULT_MAX_ATTEMPTS, 6);
-        assert_eq!(DEFAULT_MAX_DURATION_SECS, 120);
+        assert_eq!(DEFAULT_MAX_DURATION_SECS, 300);
+        assert_eq!(MAX_CONFIGURED_ATTEMPTS, 10);
+        assert_eq!(MAX_CONFIGURED_DURATION_SECS, 300);
         let policy = RetryPolicy {
             max_attempts: DEFAULT_MAX_ATTEMPTS,
             max_duration: Duration::from_secs(DEFAULT_MAX_DURATION_SECS),
             base_delay: Duration::from_millis(BASE_DELAY_MS),
             max_backoff: Duration::from_millis(MAX_BACKOFF_MS),
         };
+
+        let mut three_second_delay = RetryState::new(policy);
+        assert_eq!(
+            three_second_delay
+                .schedule("HTTP 429", Some(Duration::from_secs(3)))
+                .unwrap(),
+            Duration::from_secs(3)
+        );
 
         let mut long_delay = RetryState::new(policy);
         assert_eq!(
