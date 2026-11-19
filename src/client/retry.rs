@@ -178,7 +178,7 @@ impl RetryState {
             .map_err(|error| self.with_last_diagnostic(error))
     }
 
-    pub(super) fn retry_connection(&mut self, error: &reqwest::Error) -> Result<Duration> {
+    pub(super) fn retry_connection(&mut self, error: reqwest::Error) -> Result<Duration> {
         self.last_transport_diagnostic = Some(format!(
             "Connection failure before a provider HTTP response was received: {}",
             error.without_url()
@@ -190,14 +190,11 @@ impl RetryState {
     pub(super) fn transport_error(
         &mut self,
         context: &str,
-        error: &reqwest::Error,
+        error: reqwest::Error,
     ) -> anyhow::Error {
-        self.last_transport_diagnostic =
-            Some(format!("{context}: {}", error.without_url()));
-        self.with_last_diagnostic(anyhow!(
-            "{}",
-            self.last_transport_diagnostic.as_deref().unwrap()
-        ))
+        let transport_diagnostic = format!("{context}: {}", error.without_url());
+        self.last_transport_diagnostic = Some(transport_diagnostic.clone());
+        self.with_last_diagnostic(anyhow!("{transport_diagnostic}"))
     }
 
     pub(super) fn with_last_diagnostic(&self, error: anyhow::Error) -> anyhow::Error {
@@ -292,20 +289,20 @@ async fn send_with_retry_policy(builder: RequestBuilder, policy: RetryPolicy) ->
         let response = match request.send().await {
             Ok(response) => response,
             Err(error) if allow_retry && error.is_connect() => {
-                let delay = state.retry_connection(&error)?;
+                let delay = state.retry_connection(error)?;
                 tokio::time::sleep(delay).await;
                 continue;
             }
             Err(error) if error.is_timeout() => {
                 return Err(state.transport_error(
                     "Provider request timed out; no HTTP response was received and the request was not replayed because the provider may have received it",
-                    &error,
+                    error,
                 ));
             }
             Err(error) => {
                 return Err(state.transport_error(
                     "Transport failure; no provider HTTP response was received",
-                    &error,
+                    error,
                 ));
             }
         };
@@ -1499,7 +1496,8 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(error.to_string().contains("maximum retry duration"));
+        assert!(error.to_string().contains("retry admission budget"));
+        assert!(error.to_string().contains("next wait (1.00s)"));
         assert!(error.to_string().contains("Rate limit reached"));
         assert_eq!(requests.load(Ordering::SeqCst), 1);
         server.await.unwrap();
