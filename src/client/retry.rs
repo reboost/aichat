@@ -1143,15 +1143,11 @@ mod tests {
             "RetryInfo must be beyond the retained response-body prefix"
         );
 
-        let (url, requests, server) =
-            spawn_server(vec![MockResponse::json(429, &body)]).await;
-        let error = send_with_retry_policy(
-            post(&reqwest::Client::new(), &url),
-            quick_policy(3),
-        )
-        .await
-        .unwrap_err()
-        .to_string();
+        let (url, requests, server) = spawn_server(vec![MockResponse::json(429, &body)]).await;
+        let error = send_with_retry_policy(post(&reqwest::Client::new(), &url), quick_policy(3))
+            .await
+            .unwrap_err()
+            .to_string();
 
         assert!(error.contains("HTTP 429"), "{error}");
         assert!(
@@ -1168,18 +1164,14 @@ mod tests {
 
     #[tokio::test]
     async fn preserves_partial_provider_body_when_response_read_fails() {
-        let body = r#"{"error":{"message":"partial provider diagnostic","api_key":"partial-secret""#;
-        let (url, requests, server) = spawn_server(vec![
-            MockResponse::json(429, body).disconnect_after_body(),
-        ])
-        .await;
-        let error = send_with_retry_policy(
-            post(&reqwest::Client::new(), &url),
-            quick_policy(3),
-        )
-        .await
-        .unwrap_err()
-        .to_string();
+        let body =
+            r#"{"error":{"message":"partial provider diagnostic","api_key":"partial-secret""#;
+        let (url, requests, server) =
+            spawn_server(vec![MockResponse::json(429, body).disconnect_after_body()]).await;
+        let error = send_with_retry_policy(post(&reqwest::Client::new(), &url), quick_policy(3))
+            .await
+            .unwrap_err()
+            .to_string();
 
         for expected in [
             "HTTP 429",
