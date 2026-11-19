@@ -637,7 +637,7 @@ fn redact_assignment_values(input: &str) -> String {
                     .map(|offset| (cursor + offset, *marker))
             })
             .filter(|(index, _)| {
-                *index == 0 || !lower.as_bytes()[index - 1].is_ascii_alphanumeric()
+                *index == 0 || !lower.as_bytes()[*index - 1].is_ascii_alphanumeric()
             })
             .min_by_key(|(index, _)| *index);
         let Some((start, marker)) = found else {
