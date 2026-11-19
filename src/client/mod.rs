@@ -10,8 +10,8 @@ mod stream;
 pub use crate::function::ToolCall;
 pub use common::*;
 pub use message::*;
-pub(crate) use retry::send_with_retry;
 pub use model::*;
+pub(crate) use retry::send_with_retry;
 pub use stream::*;
 
 register_client!(

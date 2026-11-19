@@ -1,5 +1,5 @@
-use super::{catch_error, ToolCall};
 use super::retry::{is_retryable_status, RetryPolicy, RetryState};
+use super::{catch_error, ToolCall};
 use crate::utils::AbortSignal;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -140,11 +140,8 @@ where
                     let headers = response.headers().clone();
                     let body = response.text().await?;
                     if is_retryable_status(status) {
-                        retry_delay = Some(retry_state.retry_response(
-                            status,
-                            &headers,
-                            body.as_bytes(),
-                        )?);
+                        retry_delay =
+                            Some(retry_state.retry_response(status, &headers, body.as_bytes())?);
                     } else {
                         let data: Value = match body.parse() {
                             Ok(data) => data,

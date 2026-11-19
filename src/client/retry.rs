@@ -73,11 +73,8 @@ impl RetryState {
             anyhow::bail!("{message}");
         }
 
-        self.schedule(
-            &format!("HTTP {}", status.as_u16()),
-            retry_after,
-        )
-        .map_err(|err| anyhow!("{message}; {err}"))
+        self.schedule(&format!("HTTP {}", status.as_u16()), retry_after)
+            .map_err(|err| anyhow!("{message}; {err}"))
     }
 
     pub(super) fn retry_connection(&mut self) -> Result<Duration> {
@@ -134,10 +131,7 @@ pub(crate) async fn send_with_retry(builder: RequestBuilder) -> Result<Response>
     send_with_retry_policy(builder, RetryPolicy::from_env()).await
 }
 
-async fn send_with_retry_policy(
-    builder: RequestBuilder,
-    policy: RetryPolicy,
-) -> Result<Response> {
+async fn send_with_retry_policy(builder: RequestBuilder, policy: RetryPolicy) -> Result<Response> {
     let mut state = RetryState::new(policy);
 
     loop {
@@ -154,15 +148,12 @@ async fn send_with_retry_policy(
                 }
 
                 let headers = response.headers().clone();
-                let body = response
-                    .bytes()
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "Failed to read provider error response (HTTP {})",
-                            status.as_u16()
-                        )
-                    })?;
+                let body = response.bytes().await.with_context(|| {
+                    format!(
+                        "Failed to read provider error response (HTTP {})",
+                        status.as_u16()
+                    )
+                })?;
                 let delay = state.retry_response(status, &headers, &body)?;
                 tokio::time::sleep(delay).await;
             }
@@ -285,7 +276,10 @@ fn response_error_message(status: StatusCode, body: &[u8]) -> String {
     let code = data
         .pointer("/error/type")
         .and_then(serde_json::Value::as_str)
-        .or_else(|| data.pointer("/error/code").and_then(serde_json::Value::as_str))
+        .or_else(|| {
+            data.pointer("/error/code")
+                .and_then(serde_json::Value::as_str)
+        })
         .or_else(|| data.pointer("/code").and_then(serde_json::Value::as_str));
     let message: String = message
         .chars()
@@ -467,12 +461,9 @@ mod tests {
         ])
         .await;
         let started = Instant::now();
-        let response = send_with_retry_policy(
-            post(&reqwest::Client::new(), &url),
-            quick_policy(3),
-        )
-        .await
-        .unwrap();
+        let response = send_with_retry_policy(post(&reqwest::Client::new(), &url), quick_policy(3))
+            .await
+            .unwrap();
 
         assert!(response.status().is_success());
         assert!(started.elapsed() >= Duration::from_millis(950));
@@ -487,12 +478,9 @@ mod tests {
             MockResponse::json(200, r#"{"ok":true}"#),
         ])
         .await;
-        let response = send_with_retry_policy(
-            post(&reqwest::Client::new(), &url),
-            quick_policy(3),
-        )
-        .await
-        .unwrap();
+        let response = send_with_retry_policy(post(&reqwest::Client::new(), &url), quick_policy(3))
+            .await
+            .unwrap();
 
         assert!(response.status().is_success());
         assert_eq!(requests.load(Ordering::SeqCst), 2);
@@ -506,12 +494,9 @@ mod tests {
             r#"{"error":{"type":"insufficient_quota","message":"You exceeded your current quota. Check billing."}}"#,
         )])
         .await;
-        let error = send_with_retry_policy(
-            post(&reqwest::Client::new(), &url),
-            quick_policy(4),
-        )
-        .await
-        .unwrap_err();
+        let error = send_with_retry_policy(post(&reqwest::Client::new(), &url), quick_policy(4))
+            .await
+            .unwrap_err();
 
         assert!(error.to_string().contains("billing"));
         assert_eq!(requests.load(Ordering::SeqCst), 1);
@@ -522,16 +507,17 @@ mod tests {
     async fn retries_server_errors_and_anthropic_overload() {
         for status in [500, 502, 503, 504, 529] {
             let (url, requests, server) = spawn_server(vec![
-                MockResponse::json(status, r#"{"error":{"type":"overloaded_error","message":"Overloaded"}}"#),
+                MockResponse::json(
+                    status,
+                    r#"{"error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+                ),
                 MockResponse::json(200, r#"{"ok":true}"#),
             ])
             .await;
-            let response = send_with_retry_policy(
-                post(&reqwest::Client::new(), &url),
-                quick_policy(3),
-            )
-            .await
-            .unwrap();
+            let response =
+                send_with_retry_policy(post(&reqwest::Client::new(), &url), quick_policy(3))
+                    .await
+                    .unwrap();
 
             assert!(response.status().is_success());
             assert_eq!(requests.load(Ordering::SeqCst), 2);
@@ -547,12 +533,9 @@ mod tests {
             MockResponse::json(503, r#"{"message":"Temporarily unavailable"}"#),
         ])
         .await;
-        let error = send_with_retry_policy(
-            post(&reqwest::Client::new(), &url),
-            quick_policy(3),
-        )
-        .await
-        .unwrap_err();
+        let error = send_with_retry_policy(post(&reqwest::Client::new(), &url), quick_policy(3))
+            .await
+            .unwrap_err();
 
         assert!(error.to_string().contains("3 attempts"));
         assert_eq!(requests.load(Ordering::SeqCst), 3);
@@ -586,7 +569,7 @@ mod tests {
     #[tokio::test]
     async fn does_not_replay_ambiguous_request_timeouts() {
         let (url, requests, server) = spawn_server(vec![
-            MockResponse::json(200, r#"{"ok":true}"#).delay(Duration::from_millis(100)),
+            MockResponse::json(200, r#"{"ok":true}"#).delay(Duration::from_millis(100))
         ])
         .await;
         let client = reqwest::Client::builder()
@@ -622,11 +605,7 @@ mod tests {
 
     #[test]
     fn identifies_permanent_quota_errors_and_retry_after_values() {
-        assert!(permanent_failure(
-            br#"{"error":{"code":"insufficient_quota"}}"#,
-            false
-        )
-        .is_some());
+        assert!(permanent_failure(br#"{"error":{"code":"insufficient_quota"}}"#, false).is_some());
         assert!(permanent_failure(br#"{"error":{"type":"billing_error"}}"#, false).is_some());
         assert!(permanent_failure(br#"{"error":{"reason":"QUOTA_EXCEEDED"}}"#, false).is_some());
         assert!(permanent_failure(
@@ -648,10 +627,11 @@ mod tests {
 
     #[tokio::test]
     async fn stops_when_retry_after_exceeds_the_total_retry_budget() {
-        let (url, requests, server) = spawn_server(vec![
-            MockResponse::json(429, r#"{"error":{"message":"Rate limit reached"}}"#)
-                .header("Retry-After", "1"),
-        ])
+        let (url, requests, server) = spawn_server(vec![MockResponse::json(
+            429,
+            r#"{"error":{"message":"Rate limit reached"}}"#,
+        )
+        .header("Retry-After", "1")])
         .await;
         let mut policy = quick_policy(4);
         policy.max_duration = Duration::from_millis(100);
@@ -672,10 +652,7 @@ mod tests {
         ])
         .await;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut handler = crate::client::SseHandler::new(
-            tx,
-            crate::utils::AbortSignalInner::new(),
-        );
+        let mut handler = crate::client::SseHandler::new(tx, crate::utils::AbortSignalInner::new());
         let mut handled = 0;
 
         super::super::stream::sse_stream_with_policy(
@@ -724,5 +701,4 @@ mod tests {
         assert_eq!(requests.load(Ordering::SeqCst), 1);
         server.await.unwrap();
     }
-
 }
