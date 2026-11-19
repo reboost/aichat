@@ -1253,8 +1253,13 @@ mod tests {
 
     #[tokio::test]
     async fn retries_repeated_429_responses_within_the_attempt_budget() {
-        let mut responses = vec![MockResponse::json(429, r#"{"error":{"message":"Rate limited"}}"#); 4];
-        responses.push(MockResponse::json(200, r#"{"ok":true}"#));
+        let responses = vec![
+            MockResponse::json(429, r#"{"error":{"message":"Rate limited"}}"#),
+            MockResponse::json(429, r#"{"error":{"message":"Rate limited"}}"#),
+            MockResponse::json(429, r#"{"error":{"message":"Rate limited"}}"#),
+            MockResponse::json(429, r#"{"error":{"message":"Rate limited"}}"#),
+            MockResponse::json(200, r#"{"ok":true}"#),
+        ];
         let (url, requests, server) = spawn_server(responses).await;
         let response =
             send_with_retry_policy(post(&reqwest::Client::new(), &url), quick_policy(6))
@@ -1387,30 +1392,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn does_not_retry_hard_quota_or_billing_failures_with_retry_after() {
+    async fn does_not_retry_verified_billing_auth_or_long_window_quota_failures() {
         let cases = [
-            r#"{"error":{"code":"ServiceQuotaExceededException","message":"Daily quota exhausted","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"1s"}]}}"#,
-            r#"{"error":{"type":"insufficient_quota","message":"You exceeded your current quota","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"1s"}]}}"#,
-            r#"{"error":{"type":"billing_hard_limit_reached","message":"Billing hard limit reached","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"1s"}]}}"#,
-            r#"{"error":{"message":"Monthly quota exhausted","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"1s"}]}}"#,
-            r#"{"error":{"message":"Daily quota exceeded","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"1s"}]}}"#,
-            r#"{"error":{"message":"Monthly request quota exceeded","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"1s"}]}}"#,
-            r#"{"error":{"message":"You have exceeded your daily quota.","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"1s"}]}}"#,
-            r#"{"error":{"message":"Daily quota has been exhausted.","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"1s"}]}}"#,
-            r#"{"error":{"message":"You have reached your monthly limit.","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"1s"}]}}"#,
-            r#"{"error":{"message":"No remaining quota for this month.","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"1s"}]}}"#,
+            r#"{"error":{"type":"insufficient_quota","message":"You exceeded your current quota"}}"#,
+            r#"{"error":{"code":"billing_hard_limit_reached","message":"Billing hard limit reached"}}"#,
+            r#"{"error":{"code":"credit_balance_exhausted","message":"Prepaid credits exhausted"}}"#,
+            r#"{"error":{"code":"organization_spend_limit_exceeded","message":"Organization spend limit reached"}}"#,
+            r#"{"error":{"code":"invalid_api_key","message":"Invalid API key"}}"#,
+            r#"{"error":{"details":[{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{"quotaId":"GenerateRequestsPerDayPerProjectPerModel-FreeTier"}]},{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"1s"}]}}"#,
         ];
         for body in cases {
             let (url, requests, server) = spawn_server(vec![
-                MockResponse::json(429, body).header("Retry-After", "0")
+                MockResponse::json(429, body).header("Retry-After", "0"),
             ])
             .await;
             let error =
                 send_with_retry_policy(post(&reqwest::Client::new(), &url), quick_policy(4))
                     .await
-                    .unwrap_err();
+                    .unwrap_err()
+                    .to_string();
 
-            assert!(error.to_string().contains("HTTP 429"));
+            assert!(error.contains("HTTP 429"), "{error}");
             assert_eq!(requests.load(Ordering::SeqCst), 1, "{body}");
             server.await.unwrap();
         }
