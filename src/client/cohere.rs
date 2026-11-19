@@ -116,7 +116,7 @@ async fn chat_completions(
     extract_chat_completions(&data)
 }
 
-async fn chat_completions_streaming(
+pub(super) async fn chat_completions_streaming(
     builder: RequestBuilder,
     handler: &mut SseHandler,
     _model: &Model,
@@ -174,6 +174,15 @@ async fn chat_completions_streaming(
                     function_name.clear();
                     function_arguments.clear();
                     function_id.clear();
+                }
+                "message-end" => {
+                    match data["delta"]["finish_reason"].as_str() {
+                        Some("ERROR" | "TIMEOUT") => bail!(
+                            "{}",
+                            super::retry::format_stream_error(&message.event, &message.data)
+                        ),
+                        _ => return Ok(true),
+                    }
                 }
                 _ => {}
             }

@@ -2098,4 +2098,105 @@ mod tests {
         assert!(!error.contains("bedrock-test-secret"), "{error}");
         assert!(error.contains("[REDACTED]"), "{error}");
     }
+
+    #[tokio::test]
+    async fn cohere_message_end_error_preserves_details_redacts_secrets_and_never_replays() {
+        let body = concat!(
+            "event: content-delta\n",
+            "data: {\"type\":\"content-delta\",\"delta\":{\"message\":{\"content\":{\"text\":\"partial response\"}}}}\n\n",
+            "event: message-end\n",
+            "data: {\"type\":\"message-end\",\"delta\":{\"finish_reason\":\"ERROR\",\"usage\":{\"billed_units\":{\"output_tokens\":7}}},\"request_id\":\"cohere-error-123\",\"details\":{\"message\":\"inference worker terminated\"},\"api_key\":\"cohere-test-secret\"}\n\n"
+        );
+        let (url, requests, server) = spawn_server(vec![MockResponse::sse(body)]).await;
+        let (mut handler, _rx) = test_stream_handler();
+        let error = super::super::cohere::chat_completions_streaming(
+            post(&reqwest::Client::new(), &url),
+            &mut handler,
+            &crate::client::Model::new("cohere", "command-test"),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        for expected in [
+            "message-end",
+            "ERROR",
+            "cohere-error-123",
+            "inference worker terminated",
+            "output_tokens",
+        ] {
+            assert!(error.contains(expected), "{error} missing {expected}");
+        }
+        assert!(!error.contains("cohere-test-secret"), "{error}");
+        assert!(error.contains("[REDACTED]"), "{error}");
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cohere_message_end_timeout_is_an_error_and_never_replays() {
+        let body = concat!(
+            "event: message-end\n",
+            "data: {\"type\":\"message-end\",\"delta\":{\"finish_reason\":\"TIMEOUT\",\"usage\":{\"tokens\":{\"output_tokens\":12}}},\"request_id\":\"cohere-timeout-456\",\"details\":{\"message\":\"generation deadline exceeded\"}}\n\n"
+        );
+        let (url, requests, server) = spawn_server(vec![MockResponse::sse(body)]).await;
+        let (mut handler, _rx) = test_stream_handler();
+        let error = super::super::cohere::chat_completions_streaming(
+            post(&reqwest::Client::new(), &url),
+            &mut handler,
+            &crate::client::Model::new("cohere", "command-test"),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        for expected in [
+            "message-end",
+            "TIMEOUT",
+            "cohere-timeout-456",
+            "generation deadline exceeded",
+            "output_tokens",
+        ] {
+            assert!(error.contains(expected), "{error} missing {expected}");
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cohere_message_end_complete_preserves_content_and_tool_calls() {
+        let body = concat!(
+            "event: content-delta\n",
+            "data: {\"type\":\"content-delta\",\"delta\":{\"message\":{\"content\":{\"text\":\"answer\"}}}}\n\n",
+            "event: tool-plan-delta\n",
+            "data: {\"type\":\"tool-plan-delta\",\"delta\":{\"message\":{\"tool_plan\":\"checking the result\"}}}\n\n",
+            "event: tool-call-start\n",
+            "data: {\"type\":\"tool-call-start\",\"delta\":{\"message\":{\"tool_calls\":{\"id\":\"call-1\",\"function\":{\"name\":\"lookup\"}}}}}\n\n",
+            "event: tool-call-delta\n",
+            "data: {\"type\":\"tool-call-delta\",\"delta\":{\"message\":{\"tool_calls\":{\"function\":{\"arguments\":\"{\\\"query\\\":\\\"rust\\\"}\"}}}}}\n\n",
+            "event: tool-call-end\n",
+            "data: {\"type\":\"tool-call-end\"}\n\n",
+            "event: message-end\n",
+            "data: {\"type\":\"message-end\",\"delta\":{\"finish_reason\":\"COMPLETE\",\"usage\":{\"billed_units\":{\"output_tokens\":5}}}}\n\n"
+        );
+        let (url, requests, server) = spawn_server(vec![MockResponse::sse(body)]).await;
+        let (mut handler, _rx) = test_stream_handler();
+        super::super::cohere::chat_completions_streaming(
+            post(&reqwest::Client::new(), &url),
+            &mut handler,
+            &crate::client::Model::new("cohere", "command-test"),
+        )
+        .await
+        .unwrap();
+
+        let (text, calls) = handler.take();
+        assert!(text.contains("answer"), "{text}");
+        assert!(text.contains("checking the result"), "{text}");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "lookup");
+        assert_eq!(calls[0].arguments, json!({"query": "rust"}));
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        server.await.unwrap();
+    }
+
 }
