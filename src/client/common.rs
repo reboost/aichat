@@ -490,7 +490,6 @@ pub async fn noop_rerank(_builder: RequestBuilder, _model: &Model) -> Result<Rer
     bail!("The client doesn't support rerank api")
 }
 
-
 pub fn json_str_from_map<'a>(
     map: &'a serde_json::Map<String, Value>,
     field_name: &str,
