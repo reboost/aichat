@@ -3,6 +3,7 @@ use super::{catch_error, ToolCall};
 use crate::utils::AbortSignal;
 
 use anyhow::{anyhow, bail, Context, Result};
+use eventsource_stream::Eventsource;
 use futures_util::{Stream, StreamExt};
 use reqwest::RequestBuilder;
 use reqwest_eventsource::{retry::Never, Error as EventSourceError, Event, RequestBuilderExt};
@@ -100,27 +101,22 @@ where
 
 pub(super) async fn sse_stream_with_policy<F>(
     builder: RequestBuilder,
-    mut handle: F,
+    handle: F,
     policy: RetryPolicy,
 ) -> Result<()>
 where
     F: FnMut(SseMmessage) -> Result<bool>,
 {
-    let can_retry = builder.try_clone().is_some();
-    let mut builder = Some(builder);
+    if builder.try_clone().is_none() {
+        return sse_stream_once(builder, handle).await;
+    }
+
     let mut retry_state = RetryState::new(policy);
 
     loop {
-        let attempt_builder = if can_retry {
-            builder
-                .as_ref()
-                .and_then(RequestBuilder::try_clone)
-                .ok_or_else(|| anyhow!("Streaming request cannot be safely cloned for retries"))?
-        } else {
-            builder
-                .take()
-                .ok_or_else(|| anyhow!("Streaming request was already sent"))?
-        };
+        let attempt_builder = builder
+            .try_clone()
+            .ok_or_else(|| anyhow!("Streaming request cannot be safely cloned for retries"))?;
         let mut es = attempt_builder.eventsource()?;
         // Disable reqwest-eventsource's automatic reconnects; all retries must pass
         // through the shared policy, and no request may be replayed after Open.
@@ -199,6 +195,72 @@ where
             None => return Ok(()),
         }
     }
+}
+
+async fn sse_stream_once<F>(builder: RequestBuilder, mut handle: F) -> Result<()>
+where
+    F: FnMut(SseMmessage) -> Result<bool>,
+{
+    let response = builder
+        .header(reqwest::header::ACCEPT, "text/event-stream")
+        .send()
+        .await?;
+    let status = response.status();
+    if status != reqwest::StatusCode::OK {
+        let body = response.text().await?;
+        let data: Value = match body.parse() {
+            Ok(data) => data,
+            Err(_) => {
+                bail!(
+                    "Invalid response data: {body} (status: {})",
+                    status.as_u16()
+                );
+            }
+        };
+        catch_error(&data, status.as_u16())?;
+        return Ok(());
+    }
+
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    if !content_type
+        .split(';')
+        .next()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"))
+    {
+        let body = response.text().await?;
+        bail!("Invalid response event-stream. content-type: {content_type}, data: {body}");
+    }
+
+    let mut events = response.bytes_stream().eventsource();
+    while let Some(event) = events.next().await {
+        let event = match event {
+            Ok(event) => event,
+            Err(eventsource_stream::EventStreamError::Transport(err)) if err.is_timeout() => {
+                bail!(
+                    "Provider streaming request timed out and was not replayed because the provider may have received it"
+                );
+            }
+            Err(eventsource_stream::EventStreamError::Transport(_)) => {
+                bail!(
+                    "Event stream transport failed; the request was not replayed to avoid duplicate provider work"
+                );
+            }
+            Err(err) => bail!("{err}"),
+        };
+        if handle(SseMmessage {
+            event: event.event,
+            data: event.data,
+        })? {
+            return Ok(());
+        }
+    }
+
+    Ok(())
 }
 
 pub async fn json_stream<S, F, E>(mut stream: S, mut handle: F) -> Result<()>
