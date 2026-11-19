@@ -118,16 +118,13 @@ where
         let attempt_builder = builder
             .try_clone()
             .ok_or_else(|| anyhow!("Streaming request cannot be safely cloned for retries"))?;
-        let mut es = match attempt_builder.eventsource() {
-            Ok(es) => es,
-            Err(EventSourceError::Transport(err)) => {
-                return Err(retry_state.transport_error(
-                    "Streaming transport failure before a provider HTTP response was received",
-                    err,
-                ));
-            }
-            Err(err) => return Err(retry_state.with_last_diagnostic(err.into())),
-        };
+        let mut es = attempt_builder
+            .eventsource()
+            .map_err(|error| {
+                retry_state.with_last_diagnostic(anyhow!(
+                    "Streaming request could not be prepared for sending; no provider HTTP response was received: {error}"
+                ))
+            })?;
         // Disable reqwest-eventsource's automatic reconnects; all retries must pass
         // through the shared policy, and no request may be replayed after Open.
         es.set_retry_policy(Box::new(Never));
