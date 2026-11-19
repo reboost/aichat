@@ -413,7 +413,6 @@ fn permanent_failure(body: &[u8], has_retry_hint: bool) -> Option<&'static str> 
 
     let hard_exhausted_quota = [
         "permanent quota",
-        "exceeded your current quota",
         "quota is exhausted",
         "quota exhausted",
         "no remaining quota",
@@ -447,6 +446,7 @@ fn permanent_failure(body: &[u8], has_retry_hint: bool) -> Option<&'static str> 
         "quota_exceeded",
         "quota exceeded",
         "quota has been exceeded",
+        "exceeded your current quota",
         "daily quota",
         "monthly quota",
         "daily limit",
@@ -1035,7 +1035,7 @@ mod tests {
 
     #[tokio::test]
     async fn retries_gemini_quota_error_with_nested_google_retry_info() {
-        let body = r#"{"error":{"code":429,"message":"Quota exceeded for this request","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"0.08s"}]}}"#;
+        let body = r#"{"error":{"code":429,"message":"You exceeded your current quota for this request","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"0.08s"}]}}"#;
         let (url, requests, server) = spawn_server(vec![
             MockResponse::json(429, body),
             MockResponse::json(200, r#"{"ok":true}"#),
