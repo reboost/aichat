@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use reqwest::{
@@ -58,8 +58,12 @@ pub(super) async fn read_response_body(response: Response) -> Result<ResponseBod
     let mut truncated = false;
 
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.with_context(|| {
-            format!("Failed to read provider error response (HTTP {})", status.as_u16())
+        let chunk = chunk.map_err(|err| {
+            anyhow!(
+                "Failed to read provider error response (HTTP {}): {}",
+                status.as_u16(),
+                err.without_url()
+            )
         })?;
         let remaining = MAX_ERROR_RESPONSE_BYTES.saturating_sub(bytes.len());
         if chunk.len() > remaining {

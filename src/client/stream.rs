@@ -193,7 +193,8 @@ where
     let response = builder
         .header(reqwest::header::ACCEPT, "text/event-stream")
         .send()
-        .await?;
+        .await
+        .map_err(|err| err.without_url())?;
     let status = response.status();
     if status != reqwest::StatusCode::OK {
         let body = read_response_body(response).await?;
