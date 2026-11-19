@@ -1109,7 +1109,7 @@ mod tests {
                 1,
                 "period quota response was retried: {body}"
             );
-            server.await.unwrap();
+            server.abort();
         }
     }
 
