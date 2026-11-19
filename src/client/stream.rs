@@ -9,7 +9,6 @@ use eventsource_stream::Eventsource;
 use futures_util::{Stream, StreamExt};
 use reqwest::RequestBuilder;
 use reqwest_eventsource::{retry::Never, Error as EventSourceError, Event, RequestBuilderExt};
-use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
 
 pub struct SseHandler {
