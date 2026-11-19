@@ -170,7 +170,12 @@ async fn send_with_retry_policy(
                 let delay = state.retry_connection()?;
                 tokio::time::sleep(delay).await;
             }
-            Err(err) => return Err(err.into()),
+            Err(err) if err.is_timeout() => {
+                anyhow::bail!(
+                    "Provider request timed out and was not replayed because the provider may have received it"
+                );
+            }
+            Err(err) => return Err(err.without_url().into()),
         }
     }
 }
