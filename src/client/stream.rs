@@ -1,10 +1,11 @@
 use super::{catch_error, ToolCall};
+use super::retry::{is_retryable_status, RetryPolicy, RetryState};
 use crate::utils::AbortSignal;
 
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::{Stream, StreamExt};
 use reqwest::RequestBuilder;
-use reqwest_eventsource::{Error as EventSourceError, Event, RequestBuilderExt};
+use reqwest_eventsource::{retry::Never, Error as EventSourceError, Event, RequestBuilderExt};
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -90,55 +91,99 @@ pub struct SseMmessage {
     pub data: String,
 }
 
-pub async fn sse_stream<F>(builder: RequestBuilder, mut handle: F) -> Result<()>
+pub async fn sse_stream<F>(builder: RequestBuilder, handle: F) -> Result<()>
 where
     F: FnMut(SseMmessage) -> Result<bool>,
 {
-    let mut es = builder.eventsource()?;
-    while let Some(event) = es.next().await {
-        match event {
-            Ok(Event::Open) => {}
-            Ok(Event::Message(message)) => {
-                let message = SseMmessage {
-                    event: message.event,
-                    data: message.data,
-                };
-                if handle(message)? {
+    sse_stream_with_policy(builder, handle, RetryPolicy::from_env()).await
+}
+
+pub(super) async fn sse_stream_with_policy<F>(
+    builder: RequestBuilder,
+    mut handle: F,
+    policy: RetryPolicy,
+) -> Result<()>
+where
+    F: FnMut(SseMmessage) -> Result<bool>,
+{
+    let mut retry_state = RetryState::new(policy);
+
+    loop {
+        let attempt_builder = builder
+            .try_clone()
+            .ok_or_else(|| anyhow!("Streaming request cannot be safely cloned for retries"))?;
+        let mut es = attempt_builder.eventsource()?;
+        // Disable reqwest-eventsource's automatic reconnects; all retries must pass
+        // through the shared policy, and no request may be replayed after Open.
+        es.set_retry_policy(Box::new(Never));
+        let mut opened = false;
+        let mut retry_delay = None;
+
+        while let Some(event) = es.next().await {
+            match event {
+                Ok(Event::Open) => opened = true,
+                Ok(Event::Message(message)) => {
+                    let message = SseMmessage {
+                        event: message.event,
+                        data: message.data,
+                    };
+                    if handle(message)? {
+                        es.close();
+                        return Ok(());
+                    }
+                }
+                Err(EventSourceError::StreamEnded) => {
+                    es.close();
                     break;
                 }
-            }
-            Err(err) => {
-                match err {
-                    EventSourceError::StreamEnded => {}
-                    EventSourceError::InvalidStatusCode(status, res) => {
-                        let text = res.text().await?;
-                        let data: Value = match text.parse() {
+                Err(EventSourceError::InvalidStatusCode(status, response)) => {
+                    let headers = response.headers().clone();
+                    let body = response.text().await?;
+                    if is_retryable_status(status) {
+                        retry_delay = Some(retry_state.retry_response(
+                            status,
+                            &headers,
+                            body.as_bytes(),
+                        )?);
+                    } else {
+                        let data: Value = match body.parse() {
                             Ok(data) => data,
                             Err(_) => {
                                 bail!(
-                                    "Invalid response data: {text} (status: {})",
+                                    "Invalid response data: {body} (status: {})",
                                     status.as_u16()
                                 );
                             }
                         };
                         catch_error(&data, status.as_u16())?;
                     }
-                    EventSourceError::InvalidContentType(header_value, res) => {
-                        let text = res.text().await?;
-                        bail!(
-                            "Invalid response event-stream. content-type: {}, data: {text}",
-                            header_value.to_str().unwrap_or_default()
-                        );
-                    }
-                    _ => {
-                        bail!("{}", err);
-                    }
+                    es.close();
+                    break;
                 }
-                es.close();
+                Err(EventSourceError::Transport(err)) if !opened && err.is_connect() => {
+                    retry_delay = Some(retry_state.retry_connection()?);
+                    es.close();
+                    break;
+                }
+                Err(EventSourceError::InvalidContentType(header_value, response)) => {
+                    let text = response.text().await?;
+                    bail!(
+                        "Invalid response event-stream. content-type: {}, data: {text}",
+                        header_value.to_str().unwrap_or_default()
+                    );
+                }
+                Err(EventSourceError::Transport(_)) => {
+                    bail!("Event stream transport failed after request submission; the request was not replayed");
+                }
+                Err(err) => bail!("{err}"),
             }
         }
+
+        match retry_delay {
+            Some(delay) => tokio::time::sleep(delay).await,
+            None => return Ok(()),
+        }
     }
-    Ok(())
 }
 
 pub async fn json_stream<S, F, E>(mut stream: S, mut handle: F) -> Result<()>
