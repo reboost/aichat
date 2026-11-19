@@ -119,11 +119,7 @@ fn get_api_base_ext(self_: &OpenAICompatibleClient) -> Result<String> {
 
 pub async fn generic_rerank(builder: RequestBuilder, _model: &Model) -> Result<RerankOutput> {
     let res = send_with_retry(builder).await?;
-    let status = res.status();
     let mut data: Value = res.json().await?;
-    if !status.is_success() {
-        catch_error(&data, status.as_u16())?;
-    }
     if data.get("results").is_none() && data.get("data").is_some() {
         if let Some(data_obj) = data.as_object_mut() {
             if let Some(value) = data_obj.remove("data") {
