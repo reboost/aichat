@@ -420,8 +420,14 @@ fn permanent_failure(body: &[u8], has_retry_hint: bool) -> Option<&'static str> 
         "out of quota",
         "daily quota exhausted",
         "monthly quota exhausted",
+        "daily quota exceeded",
+        "monthly quota exceeded",
+        "daily request quota exceeded",
+        "monthly request quota exceeded",
         "daily quota limit exceeded",
         "monthly quota limit exceeded",
+        "daily limit exceeded",
+        "monthly limit exceeded",
         "daily limit reached",
         "monthly limit reached",
         "per-day quota exhausted",
@@ -1367,6 +1373,8 @@ mod tests {
             r#"{"error":{"type":"insufficient_quota","message":"You exceeded your current quota","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"1s"}]}}"#,
             r#"{"error":{"type":"billing_hard_limit_reached","message":"Billing hard limit reached","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"1s"}]}}"#,
             r#"{"error":{"message":"Monthly quota exhausted","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"1s"}]}}"#,
+            r#"{"error":{"message":"Daily quota exceeded","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"1s"}]}}"#,
+            r#"{"error":{"message":"Monthly request quota exceeded","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"1s"}]}}"#,
         ];
         for body in cases {
             let (url, requests, server) = spawn_server(vec![
