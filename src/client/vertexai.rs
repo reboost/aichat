@@ -199,6 +199,9 @@ pub async fn gemini_chat_completions_streaming(
     let handle = |value: &str| -> Result<()> {
             let data: Value = serde_json::from_str(value)?;
             debug!("stream-data: {data}");
+            if data.get("error").is_some_and(Value::is_object) {
+                bail!("{}", super::retry::format_stream_error("error", value));
+            }
             if let Some(parts) = data["candidates"][0]["content"]["parts"].as_array() {
                 for (i, part) in parts.iter().enumerate() {
                     if let Some(text) = part["text"].as_str() {

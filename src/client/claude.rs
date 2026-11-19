@@ -80,6 +80,12 @@ pub async fn claude_chat_completions_streaming(
     let handle = |message: SseMmessage| -> Result<bool> {
         let data: Value = serde_json::from_str(&message.data)?;
         debug!("stream-data: {data}");
+        if message.event == "error" || data["type"].as_str() == Some("error") {
+            bail!(
+                "{}",
+                super::retry::format_stream_error(&message.event, &message.data)
+            );
+        }
         if let Some(typ) = data["type"].as_str() {
             match typ {
                 "content_block_start" => {

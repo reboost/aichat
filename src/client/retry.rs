@@ -130,6 +130,20 @@ pub(super) fn response_body_text(body: &ResponseBody) -> String {
     bound_diagnostic(sanitized_body(body))
 }
 
+pub(super) fn format_stream_error(event: &str, payload: &str) -> String {
+    let body = ResponseBody {
+        bytes: payload.as_bytes().to_vec(),
+        truncated: false,
+        read_error: None,
+    };
+    let diagnostic = response_body_text(&body);
+    if event.is_empty() {
+        format!("Provider reported an in-stream error: {diagnostic}")
+    } else {
+        format!("Provider reported an in-stream error ({event}): {diagnostic}")
+    }
+}
+
 pub(super) fn format_response_error(status: StatusCode, body: &ResponseBody) -> String {
     response_error_message(status, body)
 }
@@ -1897,4 +1911,191 @@ mod tests {
         assert_eq!(requests.load(Ordering::SeqCst), 1);
         server.await.unwrap();
     }
+
+    fn test_stream_handler() -> (
+        crate::client::SseHandler,
+        tokio::sync::mpsc::UnboundedReceiver<crate::client::SseEvent>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (
+            crate::client::SseHandler::new(tx, crate::utils::AbortSignalInner::new()),
+            rx,
+        )
+    }
+
+    #[tokio::test]
+    async fn anthropic_stream_error_preserves_details_redacts_secrets_and_never_replays() {
+        let body = concat!(
+            "event: content_block_delta\n",
+            "data: {\\"type\\":\\"content_block_delta\\",\\"delta\\":{\\"text\\":\\"partial output\\"}}\n\n",
+            "event: error\n",
+            "data: {\\"type\\":\\"error\\",\\"error\\":{\\"type\\":\\"overloaded_error\\",\\"message\\":\\"Claude is overloaded\\",\\"request_id\\":\\"req-claude-123\\",\\"provider_detail\\":\\"upstream capacity exhausted\\",\\"api_key\\":\\"anthropic-test-secret\\"}}\n\n"
+        );
+        let (url, requests, server) = spawn_server(vec![MockResponse::sse(body)]).await;
+        let (mut handler, _rx) = test_stream_handler();
+        let error = super::super::claude::claude_chat_completions_streaming(
+            post(&reqwest::Client::new(), &url),
+            &mut handler,
+            &crate::client::Model::new("claude", "claude-sonnet"),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        for expected in [
+            "in-stream error (error)",
+            "overloaded_error",
+            "Claude is overloaded",
+            "req-claude-123",
+            "upstream capacity exhausted",
+        ] {
+            assert!(error.contains(expected), "{error} missing {expected}");
+        }
+        assert!(!error.contains("anthropic-test-secret"), "{error}");
+        assert!(error.contains("[REDACTED]"), "{error}");
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn anthropic_normal_content_reasoning_and_tool_events_are_preserved() {
+        let body = concat!(
+            "event: content_block_delta\n",
+            "data: {\\"type\\":\\"content_block_delta\\",\\"delta\\":{\\"thinking\\":\\"checking the result\\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\\"type\\":\\"content_block_stop\\"}\n\n",
+            "event: content_block_delta\n",
+            "data: {\\"type\\":\\"content_block_delta\\",\\"delta\\":{\\"text\\":\\"answer\\"}}\n\n",
+            "event: content_block_start\n",
+            "data: {\\"type\\":\\"content_block_start\\",\\"content_block\\":{\\"type\\":\\"tool_use\\",\\"name\\":\\"lookup\\",\\"id\\":\\"tool-1\\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\\"type\\":\\"content_block_delta\\",\\"delta\\":{\\"partial_json\\":\\"{\\\\\\"query\\\\\\\":\\\\\\"rust\\\\\\"}\\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\\"type\\":\\"content_block_stop\\"}\n\n"
+        );
+        let (url, requests, server) = spawn_server(vec![MockResponse::sse(body)]).await;
+        let (mut handler, _rx) = test_stream_handler();
+        super::super::claude::claude_chat_completions_streaming(
+            post(&reqwest::Client::new(), &url),
+            &mut handler,
+            &crate::client::Model::new("claude", "claude-sonnet"),
+        )
+        .await
+        .unwrap();
+
+        let (text, calls) = handler.take();
+        assert!(text.contains("<think>\nchecking the result\n</think>"), "{text}");
+        assert!(text.contains("answer"), "{text}");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "lookup");
+        assert_eq!(calls[0].arguments, json!({"query": "rust"}));
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn openai_stream_error_envelope_preserves_details_redacts_secrets_and_never_replays() {
+        let body = concat!(
+            "data: {\\"error\\":{\\"type\\":\\"rate_limit_error\\",\\"code\\":\\"rate_limit_exceeded\\",\\"message\\":\\"OpenAI stream rate limited\\",\\"request_id\\":\\"req-openai-456\\",\\"api_key\\":\\"openai-test-secret\\"}}\n\n"
+        );
+        let (url, requests, server) = spawn_server(vec![MockResponse::sse(body)]).await;
+        let (mut handler, _rx) = test_stream_handler();
+        let error = super::super::openai::openai_chat_completions_streaming(
+            post(&reqwest::Client::new(), &url),
+            &mut handler,
+            &crate::client::Model::new("openai", "gpt-test"),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        for expected in [
+            "rate_limit_error",
+            "rate_limit_exceeded",
+            "OpenAI stream rate limited",
+            "req-openai-456",
+        ] {
+            assert!(error.contains(expected), "{error} missing {expected}");
+        }
+        assert!(!error.contains("openai-test-secret"), "{error}");
+        assert!(error.contains("[REDACTED]"), "{error}");
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn openai_normal_content_reasoning_and_tool_events_are_preserved() {
+        let body = concat!(
+            "data: {\\"choices\\":[{\\"delta\\":{\\"reasoning_content\\":\\"planning\\"}}]}\n\n",
+            "data: {\\"choices\\":[{\\"delta\\":{\\"content\\":\\"answer\\"}}]}\n\n",
+            "data: {\\"choices\\":[{\\"delta\\":{\\"tool_calls\\":[{\\"index\\":0,\\"id\\":\\"call-1\\",\\"type\\":\\"function\\",\\"function\\":{\\"name\\":\\"lookup\\",\\"arguments\\":\\"{\\\\\\"query\\\\\\\":\\\\\\"rust\\\\\\"}\\"}}]}}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (url, requests, server) = spawn_server(vec![MockResponse::sse(body)]).await;
+        let (mut handler, _rx) = test_stream_handler();
+        super::super::openai::openai_chat_completions_streaming(
+            post(&reqwest::Client::new(), &url),
+            &mut handler,
+            &crate::client::Model::new("openai", "gpt-test"),
+        )
+        .await
+        .unwrap();
+
+        let (text, calls) = handler.take();
+        assert!(text.contains("<think>\nplanning\n</think>"), "{text}");
+        assert!(text.contains("answer"), "{text}");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "lookup");
+        assert_eq!(calls[0].arguments, json!({"query": "rust"}));
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn gemini_stream_error_envelope_preserves_details_redacts_secrets_and_never_replays() {
+        let body = r#"[{"error":{"code":429,"message":"Gemini quota exhausted","status":"RESOURCE_EXHAUSTED","details":[{"reason":"per-minute quota"}],"api_key":"gemini-test-secret"}}]"#;
+        let (url, requests, server) = spawn_server(vec![MockResponse::json(200, body)]).await;
+        let (mut handler, _rx) = test_stream_handler();
+        let error = super::super::vertexai::gemini_chat_completions_streaming(
+            post(&reqwest::Client::new(), &url),
+            &mut handler,
+            &crate::client::Model::new("gemini", "gemini-test"),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        for expected in [
+            "in-stream error (error)",
+            "Gemini quota exhausted",
+            "RESOURCE_EXHAUSTED",
+            "per-minute quota",
+        ] {
+            assert!(error.contains(expected), "{error} missing {expected}");
+        }
+        assert!(!error.contains("gemini-test-secret"), "{error}");
+        assert!(error.contains("[REDACTED]"), "{error}");
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn bedrock_stream_exception_diagnostics_are_redacted_without_losing_provider_details() {
+        let error = format_stream_error(
+            "modelStreamErrorException",
+            r#"{"originalStatusCode":429,"originalMessage":"Model overloaded; retry later","requestId":"bedrock-789","secret":"bedrock-test-secret"}"#,
+        );
+
+        for expected in [
+            "modelStreamErrorException",
+            "429",
+            "Model overloaded; retry later",
+            "bedrock-789",
+        ] {
+            assert!(error.contains(expected), "{error} missing {expected}");
+        }
+        assert!(!error.contains("bedrock-test-secret"), "{error}");
+        assert!(error.contains("[REDACTED]"), "{error}");
+    }
+
 }

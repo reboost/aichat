@@ -125,6 +125,12 @@ pub async fn openai_chat_completions_streaming(
         }
         let data: Value = serde_json::from_str(&message.data)?;
         debug!("stream-data: {data}");
+        if message.event == "error" || data.get("error").is_some_and(Value::is_object) {
+            bail!(
+                "{}",
+                super::retry::format_stream_error(&message.event, &message.data)
+            );
+        }
         if let Some(text) = data["choices"][0]["delta"]["content"]
             .as_str()
             .filter(|v| !v.is_empty())

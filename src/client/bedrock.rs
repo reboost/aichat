@@ -277,7 +277,10 @@ async fn chat_completions_streaming(
                     let payload = base64_decode(message.payload())?;
                     let data = String::from_utf8_lossy(&payload);
 
-                    bail!("Invalid response data: {data} (smithy_type: {smithy_type})")
+                    bail!(
+                        "{}",
+                        super::retry::format_stream_error(smithy_type, &data)
+                    )
                 }
                 _ => {
                     bail!("Unrecognized message, message_type: {message_type}, smithy_type: {smithy_type}",);
