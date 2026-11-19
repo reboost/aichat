@@ -280,7 +280,7 @@ async fn send_with_retry_policy(builder: RequestBuilder, policy: RetryPolicy) ->
 }
 
 pub(super) fn is_retryable_status(status: StatusCode) -> bool {
-    matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504 | 529)
+    matches!(status.as_u16(), 408 | 425 | 429 | 500 | 502 | 503 | 504 | 529)
 }
 
 fn parse_retry_after_header(headers: &HeaderMap) -> Option<Duration> {
@@ -1068,7 +1068,7 @@ mod tests {
 
     #[tokio::test]
     async fn retries_server_errors_and_anthropic_overload() {
-        for status in [500, 502, 503, 504, 529] {
+        for status in [408, 425, 500, 502, 503, 504, 529] {
             let (url, requests, server) = spawn_server(vec![
                 MockResponse::json(
                     status,
@@ -1224,8 +1224,8 @@ mod tests {
         let google_minute = br#"{"error":{"details":[{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{"quotaId":"GenerateRequestsPerMinutePerProjectPerModel-FreeTier"}]}]}}"#;
         assert!(permanent_failure(StatusCode::TOO_MANY_REQUESTS, google_minute).is_none());
 
-        assert!(!is_retryable_status(StatusCode::REQUEST_TIMEOUT));
-        assert!(!is_retryable_status(StatusCode::TOO_EARLY));
+        assert!(is_retryable_status(StatusCode::REQUEST_TIMEOUT));
+        assert!(is_retryable_status(StatusCode::TOO_EARLY));
         assert!(is_retryable_status(StatusCode::TOO_MANY_REQUESTS));
     }
 
