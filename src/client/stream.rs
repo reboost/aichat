@@ -123,7 +123,7 @@ where
             Err(EventSourceError::Transport(err)) => {
                 return Err(retry_state.transport_error(
                     "Streaming transport failure before a provider HTTP response was received",
-                    &err,
+                    err,
                 ));
             }
             Err(err) => return Err(retry_state.with_last_diagnostic(err.into())),
@@ -161,7 +161,7 @@ where
                     break;
                 }
                 Err(EventSourceError::Transport(err)) if !opened && err.is_connect() => {
-                    retry_delay = Some(retry_state.retry_connection(&err)?);
+                    retry_delay = Some(retry_state.retry_connection(err)?);
                     es.close();
                     break;
                 }
@@ -183,7 +183,7 @@ where
                     } else {
                         "Streaming transport failed before a provider HTTP response was received; the request was not replayed"
                     };
-                    return Err(retry_state.transport_error(context, &err));
+                    return Err(retry_state.transport_error(context, err));
                 }
                 Err(err) => return Err(retry_state.with_last_diagnostic(err.into())),
             }
