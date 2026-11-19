@@ -172,8 +172,15 @@ where
                         header_value.to_str().unwrap_or_default()
                     );
                 }
-                Err(EventSourceError::Transport(_)) => {
-                    bail!("Event stream transport failed after request submission; the request was not replayed");
+                Err(EventSourceError::Transport(err)) => {
+                    if err.is_timeout() {
+                        bail!(
+                            "Provider streaming request timed out and was not replayed because the provider may have received it"
+                        );
+                    }
+                    bail!(
+                        "Event stream transport failed; the request was not replayed to avoid duplicate provider work"
+                    );
                 }
                 Err(err) => bail!("{err}"),
             }
