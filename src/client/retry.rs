@@ -602,19 +602,28 @@ fn redact_assignment_values(input: &str) -> String {
         "authorization",
         "access_token",
         "access-token",
+        "access token",
         "accesskey",
         "secret_access_key",
         "secret-access-key",
         "refresh_token",
+        "refresh-token",
+        "refresh token",
         "session_token",
         "session-token",
+        "session token",
         "client_secret",
+        "client-secret",
+        "client secret",
         "private_key",
         "private-key",
+        "private key",
         "secret_key",
         "secret-key",
+        "secret key",
         "api_key",
         "api-key",
+        "api key",
         "x-api-key",
         "x_api_key",
         "apikey",
@@ -1008,12 +1017,12 @@ mod tests {
         assert!(diagnostic.contains("[REDACTED]"));
 
         let raw_body = ResponseBody {
-            bytes: b"upstream echoed Authorization: Bearer plain-secret-token and api_key=other-secret"
+            bytes: b"upstream echoed Authorization: Bearer plain-secret-token, api_key=other-secret, API key: freeform-secret"
                 .to_vec(),
             truncated: false,
         };
         let diagnostic = format_response_error(StatusCode::BAD_GATEWAY, &raw_body);
-        for secret in ["plain-secret-token", "other-secret"] {
+        for secret in ["plain-secret-token", "other-secret", "freeform-secret"] {
             assert!(!diagnostic.contains(secret), "{diagnostic}");
         }
     }
