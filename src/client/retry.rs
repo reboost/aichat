@@ -380,6 +380,102 @@ fn contains_transient_rate_limit_hint(body: &[u8]) -> bool {
     .any(|value| text.contains(value))
 }
 
+fn has_exhausted_period_quota(text: &str) -> bool {
+    const PERIOD_QUOTA_TERMS: &[&str] = &[
+        "daily quota",
+        "monthly quota",
+        "daily request quota",
+        "monthly request quota",
+        "daily quota limit",
+        "monthly quota limit",
+        "daily limit",
+        "monthly limit",
+        "daily request limit",
+        "monthly request limit",
+        "per-day quota",
+        "per-month quota",
+        "per-day limit",
+        "per-month limit",
+        "per day quota",
+        "per month quota",
+        "per day limit",
+        "per month limit",
+        "daily allowance",
+        "monthly allowance",
+        "daily usage limit",
+        "monthly usage limit",
+        "quota per day",
+        "quota per month",
+        "limit per day",
+        "limit per month",
+        "quota for today",
+        "quota for this day",
+        "quota for this month",
+        "limit for today",
+        "limit for this day",
+        "limit for this month",
+    ];
+    const EXHAUSTION_PREFIXES: &[&str] = &[
+        "exceeded ",
+        "exceeded your ",
+        "exceeded the ",
+        "exceeded a ",
+        "exhausted ",
+        "exhausted your ",
+        "exhausted the ",
+        "exhausted all of your ",
+        "reached ",
+        "reached your ",
+        "reached the ",
+        "depleted ",
+        "depleted your ",
+        "depleted the ",
+        "hit ",
+        "hit your ",
+        "hit the ",
+        "used up ",
+        "used all of your ",
+    ];
+    const EXHAUSTION_SUFFIXES: &[&str] = &[
+        " exhausted",
+        " is exhausted",
+        " was exhausted",
+        " has been exhausted",
+        " fully exhausted",
+        " is fully exhausted",
+        " has been fully exhausted",
+        " exceeded",
+        " is exceeded",
+        " was exceeded",
+        " has been exceeded",
+        " reached",
+        " is reached",
+        " was reached",
+        " has been reached",
+        " depleted",
+        " is depleted",
+        " was depleted",
+        " has been depleted",
+        " used up",
+        " is used up",
+        " has been used up",
+        " maxed out",
+        " is maxed out",
+        " has been maxed out",
+        " has run out",
+        " ran out",
+    ];
+
+    PERIOD_QUOTA_TERMS.iter().any(|term| {
+        EXHAUSTION_PREFIXES
+            .iter()
+            .any(|prefix| text.contains(&format!("{prefix}{term}")))
+            || EXHAUSTION_SUFFIXES
+                .iter()
+                .any(|suffix| text.contains(&format!("{term}{suffix}")))
+    })
+}
+
 fn permanent_failure(body: &[u8], has_retry_hint: bool) -> Option<&'static str> {
     let text = String::from_utf8_lossy(body).to_ascii_lowercase();
     let has_retry_hint = has_retry_hint || contains_transient_rate_limit_hint(body);
@@ -413,43 +509,19 @@ fn permanent_failure(body: &[u8], has_retry_hint: bool) -> Option<&'static str> 
     let hard_exhausted_quota = [
         "permanent quota",
         "quota is exhausted",
+        "quota has been exhausted",
         "quota exhausted",
+        "quota is depleted",
+        "quota has been depleted",
+        "quota depleted",
         "no remaining quota",
+        "no quota remaining",
+        "no quota left",
         "out of quota",
-        "daily quota exhausted",
-        "monthly quota exhausted",
-        "daily quota exceeded",
-        "monthly quota exceeded",
-        "daily request quota exceeded",
-        "monthly request quota exceeded",
-        "daily quota limit exceeded",
-        "monthly quota limit exceeded",
-        "daily limit exceeded",
-        "monthly limit exceeded",
-        "daily limit reached",
-        "monthly limit reached",
-        "per-day quota exhausted",
-        "per-month quota exhausted",
-        "daily quota",
-        "monthly quota",
-        "daily limit",
-        "monthly limit",
-        "per-day limit",
-        "per-month limit",
-        "per day quota",
-        "per month quota",
-        "quota per day",
-        "quota per month",
-        "quota for today",
-        "quota for this day",
-        "quota for this month",
-        "daily allowance",
-        "monthly allowance",
-        "daily usage limit",
-        "monthly usage limit",
     ]
     .iter()
-    .any(|value| text.contains(value));
+    .any(|value| text.contains(value))
+        || has_exhausted_period_quota(&text);
     if hard_exhausted_quota {
         return Some(
             "The provider reports an exhausted quota; check its quota limits or billing settings",
@@ -1349,6 +1421,25 @@ mod tests {
         );
 
         for body in [
+            br#"{"error":{"message":"Your daily quota is 100 requests."}}"#.as_slice(),
+            br#"{"error":{"message":"Monthly quota is available."}}"#.as_slice(),
+            br#"{"error":{"message":"Your daily limit resets tomorrow."}}"#.as_slice(),
+            br#"{"error":{"message":"Monthly allowance: 500 requests."}}"#.as_slice(),
+            br#"{"error":{"message":"Daily quota available: 20 requests; request rate limit exceeded per minute."}}"#.as_slice(),
+            br#"{"error":{"message":"Monthly limit allows 1,000 requests; per-second rate limit exceeded."}}"#.as_slice(),
+        ] {
+            assert!(
+                permanent_failure(body, false).is_none(),
+                "period quota mention without exhaustion must remain retryable: {}",
+                String::from_utf8_lossy(body)
+            );
+        }
+
+        for body in [
+            br#"{"error":{"message":"You have exceeded your daily quota."}}"#.as_slice(),
+            br#"{"error":{"message":"Daily quota has been exhausted."}}"#.as_slice(),
+            br#"{"error":{"message":"You have reached your monthly limit."}}"#.as_slice(),
+            br#"{"error":{"message":"No remaining quota for this month."}}"#.as_slice(),
             br#"{"error":{"message":"You have exceeded your daily quota. Try again tomorrow."}}"#.as_slice(),
             br#"{"error":{"message":"Daily quota has been exceeded. Retry in 24 hours."}}"#.as_slice(),
             br#"{"error":{"message":"You have exceeded the quota for this month. Try again next month."}}"#.as_slice(),
@@ -1480,6 +1571,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retries_rate_limits_when_daily_or_monthly_quota_is_only_mentioned() {
+        let cases = [
+            r#"{"error":{"message":"Daily quota available: 20 requests; request rate limit exceeded per minute."}}"#,
+            r#"{"error":{"message":"Monthly limit allows 1,000 requests; per-second rate limit exceeded."}}"#,
+        ];
+        for body in cases {
+            let (url, requests, server) = spawn_server(vec![
+                MockResponse::json(429, body),
+                MockResponse::json(200, r#"{"ok":true}"#),
+            ])
+            .await;
+            let response =
+                send_with_retry_policy(post(&reqwest::Client::new(), &url), quick_policy(3))
+                    .await
+                    .unwrap();
+
+            assert!(response.status().is_success(), "{body}");
+            assert_eq!(requests.load(Ordering::SeqCst), 2, "{body}");
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn does_not_retry_hard_quota_or_billing_failures_with_retry_after() {
         let cases = [
             r#"{"error":{"code":"ServiceQuotaExceededException","message":"Daily quota exhausted","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"1s"}]}}"#,
@@ -1488,6 +1602,10 @@ mod tests {
             r#"{"error":{"message":"Monthly quota exhausted","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"1s"}]}}"#,
             r#"{"error":{"message":"Daily quota exceeded","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"1s"}]}}"#,
             r#"{"error":{"message":"Monthly request quota exceeded","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"1s"}]}}"#,
+            r#"{"error":{"message":"You have exceeded your daily quota.","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"1s"}]}}"#,
+            r#"{"error":{"message":"Daily quota has been exhausted.","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"1s"}]}}"#,
+            r#"{"error":{"message":"You have reached your monthly limit.","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"1s"}]}}"#,
+            r#"{"error":{"message":"No remaining quota for this month.","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"1s"}]}}"#,
         ];
         for body in cases {
             let (url, requests, server) = spawn_server(vec![
