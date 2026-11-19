@@ -301,6 +301,7 @@ fn parse_google_duration(value: &str) -> Option<Duration> {
     if seconds.is_empty()
         || !seconds.bytes().all(|byte| byte.is_ascii_digit())
         || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+        || (value.contains('.') && fraction.is_empty())
         || fraction.len() > 9
     {
         return None;
@@ -315,6 +316,9 @@ fn parse_google_duration(value: &str) -> Option<Duration> {
     } else {
         format!("{fraction:0<9}").parse::<u32>().ok()?
     };
+    if seconds == 315_576_000_000 && nanos > 0 {
+        return None;
+    }
     Duration::from_secs(seconds).checked_add(Duration::from_nanos(nanos))
 }
 
@@ -944,7 +948,7 @@ mod tests {
 
     #[tokio::test]
     async fn retries_gemini_quota_error_with_nested_google_retry_info() {
-        let body = r#"{"error":{"code":429,"message":"You exceeded your current quota for this request","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"0.08s"}]}}"#;
+        let body = r#"{"error":{"code":429,"message":"You exceeded your current quota for this request","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{"quotaId":"GenerateRequestsPerMinutePerProjectPerModel-FreeTier"}]},{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"0.08s"}]}}"#;
         let (url, requests, server) = spawn_server(vec![
             MockResponse::json(429, body),
             MockResponse::json(200, r#"{"ok":true}"#),
@@ -1216,6 +1220,8 @@ mod tests {
 
         let google_daily = br#"{"error":{"details":[{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{"quotaId":"GenerateRequestsPerDayPerProjectPerModel-FreeTier"}]},{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"59s"}]}}"#;
         assert!(permanent_failure(StatusCode::TOO_MANY_REQUESTS, google_daily).is_some());
+        let google_monthly = br#"{"error":{"details":[{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{"quotaId":"GenerateRequestsPerMonthPerProject"}]}]}}"#;
+        assert!(permanent_failure(StatusCode::TOO_MANY_REQUESTS, google_monthly).is_some());
         let google_minute = br#"{"error":{"details":[{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{"quotaId":"GenerateRequestsPerMinutePerProjectPerModel-FreeTier"}]}]}}"#;
         assert!(permanent_failure(StatusCode::TOO_MANY_REQUESTS, google_minute).is_none());
 
