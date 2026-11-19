@@ -468,7 +468,7 @@ mod tests {
 
     fn chunked_body_complete(mut body: &[u8]) -> bool {
         loop {
-            let Some(line_end) = body.windows(2).position(|value| value == b"\\r\\n") else {
+            let Some(line_end) = body.windows(2).position(|value| value == b"\r\n") else {
                 return false;
             };
             let size_line = String::from_utf8_lossy(&body[..line_end]);
@@ -481,10 +481,10 @@ mod tests {
             };
             body = &body[line_end + 2..];
             if size == 0 {
-                return body.starts_with(b"\\r\\n")
-                    || body.windows(4).any(|value| value == b"\\r\\n\\r\\n");
+                return body.starts_with(b"\r\n")
+                    || body.windows(4).any(|value| value == b"\r\n\r\n");
             }
-            if body.len() < size + 2 || &body[size..size + 2] != b"\\r\\n" {
+            if body.len() < size + 2 || &body[size..size + 2] != b"\r\n" {
                 return false;
             }
             body = &body[size + 2..];
@@ -773,7 +773,7 @@ mod tests {
     #[tokio::test]
     async fn does_not_retry_non_cloneable_sse_request() {
         let (url, requests, server) =
-            spawn_server(vec![MockResponse::sse("data: single-response\\n\\n")]).await;
+            spawn_server(vec![MockResponse::sse("data: single-response\n\n")]).await;
         let body = reqwest::Body::wrap_stream(futures_util::stream::iter(vec![
             Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"non-cloneable request body")),
         ]));
