@@ -476,13 +476,12 @@ fn response_error_message(status: StatusCode, body: &ResponseBody) -> String {
                 &data,
                 &[
                     "/error/code",
-                    "/error/status",
                     "/code",
-                    "/status",
                     "/errors/0/code",
                     "/errors/0/reason",
                 ],
             );
+            let provider_status = first_string(&data, &["/error/status", "/status"]);
             let details = first_value(
                 &data,
                 &[
@@ -503,6 +502,9 @@ fn response_error_message(status: StatusCode, body: &ResponseBody) -> String {
             }
             if let Some(code) = code {
                 parts.push(format!("code: {code}"));
+            }
+            if let Some(provider_status) = provider_status {
+                parts.push(format!("provider status: {provider_status}"));
             }
             if let Some(details) = details {
                 if let Ok(details) = serde_json::to_string(details) {
@@ -587,7 +589,7 @@ fn redact_secret_text(value: &str) -> String {
     }
     value
         .chars()
-        .filter(|value| !value.is_control() || matches!(value, '\n' | '\t'))
+        .filter(|value| !value.is_control() || matches!(*value, '\n' | '\t'))
         .collect()
 }
 
@@ -654,12 +656,16 @@ fn redact_assignment_values(input: &str) -> String {
             position += 1;
         }
         let value_start = position;
-        let quote = value.as_bytes().get(value_start.wrapping_sub(1)).copied();
-        let value_end = if matches!(quote, Some(b'"' | b'\'')) {
+        let quote = value
+            .as_bytes()
+            .get(value_start.wrapping_sub(1))
+            .copied()
+            .filter(|quote| matches!(*quote, b'"' | b'\''));
+        let value_end = if let Some(quote) = quote {
             value[value_start..]
                 .as_bytes()
                 .iter()
-                .position(|byte| *byte == quote.unwrap())
+                .position(|byte| *byte == quote)
                 .map(|offset| value_start + offset)
                 .unwrap_or(value.len())
         } else {
