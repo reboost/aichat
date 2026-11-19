@@ -227,7 +227,10 @@ impl RetryState {
         let delay = self
             .backoff_delay()
             .max(requested_delay.unwrap_or_default());
-        let remaining = self.policy.max_duration.saturating_sub(self.started.elapsed());
+        let remaining = self
+            .policy
+            .max_duration
+            .saturating_sub(self.started.elapsed());
         if delay > remaining {
             anyhow::bail!(
                 "HTTP recovery stopped after {} attempts because the next wait ({:.2}s) does not fit the remaining retry admission budget ({:.2}s); {reason}",
@@ -1477,7 +1480,10 @@ mod tests {
         assert!(error.contains(r#""retryDelay":"later""#), "{error}");
         assert!(error.contains("rate_limit_exceeded"), "{error}");
         assert!(error.contains("malformed-retry-123"), "{error}");
-        assert!(error.contains("GenerateRequestsPerMinutePerProjectPerModel-FreeTier"), "{error}");
+        assert!(
+            error.contains("GenerateRequestsPerMinutePerProjectPerModel-FreeTier"),
+            "{error}"
+        );
         assert_eq!(requests.load(Ordering::SeqCst), 1);
         server.abort();
     }
@@ -1704,7 +1710,10 @@ mod tests {
             .to_string();
 
         assert!(error.contains("next wait (3.00s)"), "{error}");
-        assert!(error.contains("remaining retry admission budget"), "{error}");
+        assert!(
+            error.contains("remaining retry admission budget"),
+            "{error}"
+        );
         assert!(error.contains("provider rate limit"), "{error}");
         assert!(error.contains("rate_limit_exceeded"), "{error}");
         assert!(error.contains("budget-error-123"), "{error}");
@@ -1730,7 +1739,10 @@ mod tests {
         assert!(error.contains("rate_limit_exceeded"), "{error}");
         assert!(error.contains("latest-request-456"), "{error}");
         assert!(error.contains("per-minute"), "{error}");
-        assert!(error.contains("HTTP recovery exhausted after 2 attempts"), "{error}");
+        assert!(
+            error.contains("HTTP recovery exhausted after 2 attempts"),
+            "{error}"
+        );
         assert!(!error.contains("first provider response"), "{error}");
         assert_eq!(requests.load(Ordering::SeqCst), 2);
         server.await.unwrap();
@@ -1740,7 +1752,7 @@ mod tests {
     async fn preserves_provider_response_when_a_retry_fails_at_transport_layer() {
         let body = r#"{"error":{"code":"rate_limit_exceeded","message":"provider asked us to retry","details":[{"request_id":"transport-followup-789","quota":"minute-limit"}]}}"#;
         let (url, requests, server) = spawn_server(vec![
-            MockResponse::json(429, body).header("Retry-After", "0"),
+            MockResponse::json(429, body).header("Retry-After", "0")
         ])
         .await;
         let error = send_with_retry_policy(post(&reqwest::Client::new(), &url), quick_policy(2))
@@ -1753,8 +1765,14 @@ mod tests {
         assert!(error.contains("rate_limit_exceeded"), "{error}");
         assert!(error.contains("transport-followup-789"), "{error}");
         assert!(error.contains("minute-limit"), "{error}");
-        assert!(error.contains("Connection failure before a provider HTTP response was received"), "{error}");
-        assert!(error.contains("HTTP recovery exhausted after 2 attempts"), "{error}");
+        assert!(
+            error.contains("Connection failure before a provider HTTP response was received"),
+            "{error}"
+        );
+        assert!(
+            error.contains("HTTP recovery exhausted after 2 attempts"),
+            "{error}"
+        );
         assert_eq!(requests.load(Ordering::SeqCst), 1);
         server.await.unwrap();
     }
@@ -1763,7 +1781,7 @@ mod tests {
     async fn sse_handshake_failure_preserves_provider_response_and_transport_error() {
         let body = r#"{"error":{"code":"overloaded_error","message":"stream handshake rejected","details":[{"request_id":"sse-handshake-321","reason":"upstream busy"}]}}"#;
         let (url, requests, server) = spawn_server(vec![
-            MockResponse::json(503, body).header("Retry-After", "0"),
+            MockResponse::json(503, body).header("Retry-After", "0")
         ])
         .await;
         let error = super::super::stream::sse_stream_with_policy(
@@ -1780,9 +1798,10 @@ mod tests {
         assert!(error.contains("overloaded_error"), "{error}");
         assert!(error.contains("sse-handshake-321"), "{error}");
         assert!(error.contains("upstream busy"), "{error}");
-        assert!(error.contains("Connection failure before a provider HTTP response was received"), "{error}");
+        assert!(
+            error.contains("Connection failure before a provider HTTP response was received"),
+            "{error}"
+        );
         assert_eq!(requests.load(Ordering::SeqCst), 1);
         server.await.unwrap();
-    }
-
-}
+    }}
