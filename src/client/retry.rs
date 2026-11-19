@@ -176,13 +176,6 @@ impl RetryState {
         self.last_diagnostic = Some(response_error_message(status, body));
         self.last_transport_diagnostic = None;
 
-        if body.truncated || body.read_error.is_some() {
-            return Err(self.with_last_diagnostic(anyhow!(
-                "HTTP {} response body is incomplete; provider retry instructions cannot be determined, so retrying was refused",
-                status.as_u16()
-            )));
-        }
-
         let required_delay = retry_delay(headers, &body.bytes)
             .map_err(|reason| self.with_last_diagnostic(anyhow!(reason)))?;
 
@@ -192,6 +185,12 @@ impl RetryState {
         if !allow_retry || !is_retryable_status(status) {
             return Err(self.with_last_diagnostic(anyhow!(
                 "HTTP {} response was not retried",
+                status.as_u16()
+            )));
+        }
+        if body.truncated || body.read_error.is_some() {
+            return Err(self.with_last_diagnostic(anyhow!(
+                "HTTP {} response body is incomplete; provider retry instructions cannot be determined, so retrying was refused",
                 status.as_u16()
             )));
         }
