@@ -50,22 +50,28 @@ impl RetryPolicy {
 pub(super) struct ResponseBody {
     pub(super) bytes: Vec<u8>,
     pub(super) truncated: bool,
+    read_error: Option<String>,
 }
 
-pub(super) async fn read_response_body(response: Response) -> Result<ResponseBody> {
+pub(super) async fn read_response_body(response: Response) -> ResponseBody {
     let status = response.status();
     let mut stream = response.bytes_stream();
     let mut bytes = Vec::new();
     let mut truncated = false;
+    let mut read_error = None;
 
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| {
-            anyhow!(
-                "Failed to read provider error response (HTTP {}): {}",
-                status.as_u16(),
-                error.without_url()
-            )
-        })?;
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                read_error = Some(format!(
+                    "Failed to read provider error response (HTTP {}): {}",
+                    status.as_u16(),
+                    error.without_url()
+                ));
+                break;
+            }
+        };
         let remaining = MAX_ERROR_RESPONSE_BYTES - bytes.len();
         if chunk.len() > remaining {
             bytes.extend_from_slice(&chunk[..remaining]);
@@ -75,7 +81,11 @@ pub(super) async fn read_response_body(response: Response) -> Result<ResponseBod
         bytes.extend_from_slice(&chunk);
     }
 
-    Ok(ResponseBody { bytes, truncated })
+    ResponseBody {
+        bytes,
+        truncated,
+        read_error,
+    }
 }
 
 fn sanitized_body(body: &ResponseBody) -> String {
@@ -92,11 +102,16 @@ fn sanitized_body(body: &ResponseBody) -> String {
         }
         Err(_) => redact_secret_text(&raw),
     };
+    let mut text = text;
     if body.truncated {
-        format!("{text}\n[response body truncated after {MAX_ERROR_RESPONSE_BYTES} bytes]")
-    } else {
-        text
+        text.push_str(&format!(
+            "\n[response body truncated after {MAX_ERROR_RESPONSE_BYTES} bytes]"
+        ));
     }
+    if let Some(error) = &body.read_error {
+        text.push_str(&format!("\n[response body incomplete: {error}]"));
+    }
+    text
 }
 
 fn bound_diagnostic(mut text: String) -> String {
@@ -160,6 +175,13 @@ impl RetryState {
     ) -> Result<Duration> {
         self.last_diagnostic = Some(response_error_message(status, body));
         self.last_transport_diagnostic = None;
+
+        if body.truncated || body.read_error.is_some() {
+            return Err(self.with_last_diagnostic(anyhow!(
+                "HTTP {} response body is incomplete; provider retry instructions cannot be determined, so retrying was refused",
+                status.as_u16()
+            )));
+        }
 
         let required_delay = retry_delay(headers, &body.bytes)
             .map_err(|reason| self.with_last_diagnostic(anyhow!(reason)))?;
@@ -316,9 +338,7 @@ async fn send_with_retry_policy(builder: RequestBuilder, policy: RetryPolicy) ->
 
         let status = response.status();
         let headers = response.headers().clone();
-        let body = read_response_body(response)
-            .await
-            .map_err(|error| state.with_last_diagnostic(error))?;
+        let body = read_response_body(response).await;
         let delay = state.retry_response(status, &headers, &body, allow_retry)?;
         tokio::time::sleep(delay).await;
     }
@@ -737,6 +757,7 @@ mod tests {
         content_type: &'static str,
         body: String,
         delay: Duration,
+        content_length: Option<usize>,
     }
 
     impl MockResponse {
@@ -747,6 +768,7 @@ mod tests {
                 content_type: "application/json",
                 body: body.to_string(),
                 delay: Duration::ZERO,
+                content_length: None,
             }
         }
 
@@ -757,6 +779,7 @@ mod tests {
                 content_type: "text/event-stream",
                 body: body.to_string(),
                 delay: Duration::ZERO,
+                content_length: None,
             }
         }
 
@@ -767,6 +790,11 @@ mod tests {
 
         fn delay(mut self, delay: Duration) -> Self {
             self.delay = delay;
+            self
+        }
+
+        fn disconnect_after_body(mut self) -> Self {
+            self.content_length = Some(self.body.len() + 32);
             self
         }
     }
@@ -804,6 +832,7 @@ mod tests {
                 }
 
                 let body = response.body.into_bytes();
+                let content_length = response.content_length.unwrap_or(body.len());
                 let reason = match response.status {
                     200 => "OK",
                     429 => "Too Many Requests",
@@ -818,7 +847,7 @@ mod tests {
                     "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nContent-Type: {}\r\nConnection: close\r\n",
                     response.status,
                     reason,
-                    body.len(),
+                    content_length,
                     response.content_type
                 );
                 for (name, value) in response.headers {
@@ -928,6 +957,7 @@ mod tests {
             let body = ResponseBody {
                 bytes: bytes.to_vec(),
                 truncated: false,
+                read_error: None,
             };
             let diagnostic = format_response_error(StatusCode::TOO_MANY_REQUESTS, &body);
             for value in expected {
@@ -939,6 +969,7 @@ mod tests {
         let body = ResponseBody {
             bytes: raw.to_vec(),
             truncated: false,
+            read_error: None,
         };
         let diagnostic = format_response_error(StatusCode::BAD_GATEWAY, &body);
         assert!(diagnostic.contains("HTTP 502"));
@@ -948,6 +979,7 @@ mod tests {
         let body = ResponseBody {
             bytes: raw_json.to_vec(),
             truncated: false,
+            read_error: None,
         };
         let diagnostic = format_response_error(StatusCode::TOO_MANY_REQUESTS, &body);
         assert!(diagnostic.contains(std::str::from_utf8(raw_json).unwrap()));
@@ -958,6 +990,7 @@ mod tests {
         let body = ResponseBody {
             bytes: br#"{"error":"invalid_grant","error_description":"The refresh token has expired or been revoked. Re-authorize the account.","error_uri":"https://developers.google.com/identity/protocols/oauth2","error_hint":"Reconnect the Google account","request_id":"oauth-request-123","provider_detail":"Contact support with this request ID","client_secret":"oauth-test-secret"}"#.to_vec(),
             truncated: false,
+            read_error: None,
         };
 
         let diagnostic = format_response_error(StatusCode::BAD_REQUEST, &body);
@@ -982,6 +1015,7 @@ mod tests {
         let json_body = ResponseBody {
             bytes: br#"{"service":{"api_key":"json-secret-key","refresh_token":"refresh-secret","note":"Authorization: Bearer header-secret","key":"provider-diagnostic-key","request_id":"request-123"}}"#.to_vec(),
             truncated: false,
+            read_error: None,
         };
         let diagnostic = format_response_error(StatusCode::BAD_REQUEST, &json_body);
         for secret in ["json-secret-key", "refresh-secret", "header-secret"] {
@@ -995,6 +1029,7 @@ mod tests {
             bytes: b"upstream echoed Authorization: Bearer plain-secret-token, api_key=other-secret, API key: freeform-secret"
                 .to_vec(),
             truncated: false,
+            read_error: None,
         };
         let diagnostic = format_response_error(StatusCode::BAD_GATEWAY, &raw_body);
         for secret in ["plain-secret-token", "other-secret", "freeform-secret"] {
@@ -1004,6 +1039,7 @@ mod tests {
         let truncated = ResponseBody {
             bytes: vec![b'x'; MAX_ERROR_RESPONSE_BYTES],
             truncated: true,
+            read_error: None,
         };
         let diagnostic = format_response_error(StatusCode::BAD_GATEWAY, &truncated);
         assert!(diagnostic.contains("response body truncated after 65536 bytes"));
@@ -1093,6 +1129,68 @@ mod tests {
             "{}",
             error.len()
         );
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn refuses_retry_when_google_retry_info_is_beyond_diagnostic_limit() {
+        let body = format!(
+            r#"{{"error":{{"message":"{}","details":[{{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"120s"}}]}}}}"#,
+            "x".repeat(MAX_ERROR_RESPONSE_BYTES)
+        );
+        assert!(
+            body.find("\"retryDelay\"").unwrap() > MAX_ERROR_RESPONSE_BYTES,
+            "RetryInfo must be beyond the retained response-body prefix"
+        );
+
+        let (url, requests, server) =
+            spawn_server(vec![MockResponse::json(429, &body)]).await;
+        let error = send_with_retry_policy(
+            post(&reqwest::Client::new(), &url),
+            quick_policy(3),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("HTTP 429"), "{error}");
+        assert!(
+            error.contains("response body truncated after 65536 bytes"),
+            "{error}"
+        );
+        assert!(
+            error.contains("provider retry instructions cannot be determined"),
+            "{error}"
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn preserves_partial_provider_body_when_response_read_fails() {
+        let body = r#"{"error":{"message":"partial provider diagnostic","api_key":"partial-secret""#;
+        let (url, requests, server) = spawn_server(vec![
+            MockResponse::json(429, body).disconnect_after_body(),
+        ])
+        .await;
+        let error = send_with_retry_policy(
+            post(&reqwest::Client::new(), &url),
+            quick_policy(3),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        for expected in [
+            "HTTP 429",
+            "partial provider diagnostic",
+            "response body incomplete",
+            "Failed to read provider error response (HTTP 429)",
+        ] {
+            assert!(error.contains(expected), "{error} missing {expected}");
+        }
+        assert!(!error.contains("partial-secret"), "{error}");
         assert_eq!(requests.load(Ordering::SeqCst), 1);
         server.await.unwrap();
     }
@@ -1267,6 +1365,7 @@ mod tests {
         let body = ResponseBody {
             bytes: CAPTURED_GEMINI_RATE_LIMIT.as_bytes().to_vec(),
             truncated: false,
+            read_error: None,
         };
         let data: Value = serde_json::from_slice(&body.bytes).unwrap();
 
@@ -1299,6 +1398,7 @@ mod tests {
         let response_body = ResponseBody {
             bytes: body.to_vec(),
             truncated: false,
+            read_error: None,
         };
         let mut state = RetryState::new(production_default_policy());
         let error = state
@@ -1698,6 +1798,7 @@ mod tests {
         let body = ResponseBody {
             bytes: br#"{"error":{"code":"rate_limit_exceeded","message":"provider rate limit","details":[{"request_id":"budget-error-123"}]}}"#.to_vec(),
             truncated: false,
+            read_error: None,
         };
         let mut headers = HeaderMap::new();
         headers.insert(RETRY_AFTER, "3".parse().unwrap());

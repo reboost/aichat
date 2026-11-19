@@ -150,9 +150,7 @@ where
                 }
                 Err(EventSourceError::InvalidStatusCode(status, response)) => {
                     let headers = response.headers().clone();
-                    let body = read_response_body(response)
-                        .await
-                        .map_err(|error| retry_state.with_last_diagnostic(error))?;
+                    let body = read_response_body(response).await;
                     retry_delay = Some(retry_state.retry_response(status, &headers, &body, true)?);
                     es.close();
                     break;
@@ -164,7 +162,7 @@ where
                 }
                 Err(EventSourceError::InvalidContentType(header_value, response)) => {
                     let status = response.status();
-                    let body = read_response_body(response).await?;
+                    let body = read_response_body(response).await;
                     bail!(
                         "Invalid response event-stream. HTTP {} content-type: {}, data: {}",
                         status.as_u16(),
@@ -209,7 +207,7 @@ where
         })?;
     let status = response.status();
     if status != reqwest::StatusCode::OK {
-        let body = read_response_body(response).await?;
+        let body = read_response_body(response).await;
         bail!("{}", format_response_error(status, &body));
     }
 
@@ -225,7 +223,7 @@ where
         .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"))
     {
         let status = response.status();
-        let body = read_response_body(response).await?;
+        let body = read_response_body(response).await;
         bail!(
             "Invalid response event-stream. HTTP {} content-type: {content_type}, data: {}",
             status.as_u16(),
