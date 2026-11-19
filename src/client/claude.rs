@@ -63,11 +63,7 @@ pub async fn claude_chat_completions(
     _model: &Model,
 ) -> Result<ChatCompletionsOutput> {
     let res = send_with_retry(builder).await?;
-    let status = res.status();
     let data: Value = res.json().await?;
-    if !status.is_success() {
-        catch_error(&data, status.as_u16())?;
-    }
     debug!("non-stream-data: {data}");
     claude_extract_chat_completions(&data)
 }
@@ -84,6 +80,12 @@ pub async fn claude_chat_completions_streaming(
     let handle = |message: SseMmessage| -> Result<bool> {
         let data: Value = serde_json::from_str(&message.data)?;
         debug!("stream-data: {data}");
+        if message.event == "error" || data["type"].as_str() == Some("error") {
+            bail!(
+                "{}",
+                super::retry::format_stream_error(&message.event, &message.data)
+            );
+        }
         if let Some(typ) = data["type"].as_str() {
             match typ {
                 "content_block_start" => {

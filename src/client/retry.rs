@@ -8,8 +8,8 @@ use reqwest::{
 use serde_json::Value;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const DEFAULT_MAX_ATTEMPTS: usize = 4;
-const DEFAULT_MAX_DURATION_SECS: u64 = 30;
+const DEFAULT_MAX_ATTEMPTS: usize = 6;
+const DEFAULT_MAX_DURATION_SECS: u64 = 300;
 const MAX_CONFIGURED_ATTEMPTS: usize = 10;
 const MAX_CONFIGURED_DURATION_SECS: u64 = 300;
 const BASE_DELAY_MS: u64 = 250;
@@ -29,18 +29,18 @@ impl RetryPolicy {
     pub(super) fn from_env() -> Self {
         let max_attempts = std::env::var("AICHAT_HTTP_RETRY_MAX_ATTEMPTS")
             .ok()
-            .and_then(|v| v.parse::<usize>().ok())
+            .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(DEFAULT_MAX_ATTEMPTS)
             .clamp(1, MAX_CONFIGURED_ATTEMPTS);
-        let max_duration_secs = std::env::var("AICHAT_HTTP_RETRY_MAX_DURATION_SECS")
+        let max_duration = std::env::var("AICHAT_HTTP_RETRY_MAX_DURATION_SECS")
             .ok()
-            .and_then(|v| v.parse::<u64>().ok())
+            .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(DEFAULT_MAX_DURATION_SECS)
             .min(MAX_CONFIGURED_DURATION_SECS);
 
         Self {
             max_attempts,
-            max_duration: Duration::from_secs(max_duration_secs),
+            max_duration: Duration::from_secs(max_duration),
             base_delay: Duration::from_millis(BASE_DELAY_MS),
             max_backoff: Duration::from_millis(MAX_BACKOFF_MS),
         }
@@ -50,23 +50,29 @@ impl RetryPolicy {
 pub(super) struct ResponseBody {
     pub(super) bytes: Vec<u8>,
     pub(super) truncated: bool,
+    read_error: Option<String>,
 }
 
-pub(super) async fn read_response_body(response: Response) -> Result<ResponseBody> {
+pub(super) async fn read_response_body(response: Response) -> ResponseBody {
     let status = response.status();
     let mut stream = response.bytes_stream();
     let mut bytes = Vec::new();
     let mut truncated = false;
+    let mut read_error = None;
 
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|err| {
-            anyhow!(
-                "Failed to read provider error response (HTTP {}): {}",
-                status.as_u16(),
-                err.without_url()
-            )
-        })?;
-        let remaining = MAX_ERROR_RESPONSE_BYTES.saturating_sub(bytes.len());
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                read_error = Some(format!(
+                    "Failed to read provider error response (HTTP {}): {}",
+                    status.as_u16(),
+                    error.without_url()
+                ));
+                break;
+            }
+        };
+        let remaining = MAX_ERROR_RESPONSE_BYTES - bytes.len();
         if chunk.len() > remaining {
             bytes.extend_from_slice(&chunk[..remaining]);
             truncated = true;
@@ -75,15 +81,66 @@ pub(super) async fn read_response_body(response: Response) -> Result<ResponseBod
         bytes.extend_from_slice(&chunk);
     }
 
-    Ok(ResponseBody { bytes, truncated })
+    ResponseBody {
+        bytes,
+        truncated,
+        read_error,
+    }
+}
+
+fn sanitized_body(body: &ResponseBody) -> String {
+    let raw = String::from_utf8_lossy(&body.bytes);
+    let text = match serde_json::from_slice::<Value>(&body.bytes) {
+        Ok(mut data) => {
+            let original = data.clone();
+            redact_json_secrets(&mut data);
+            if data == original {
+                raw.to_string()
+            } else {
+                serde_json::to_string(&data).unwrap_or_else(|_| redact_secret_text(&raw))
+            }
+        }
+        Err(_) => redact_secret_text(&raw),
+    };
+    let mut text = text;
+    if body.truncated {
+        text.push_str(&format!(
+            "\n[response body truncated after {MAX_ERROR_RESPONSE_BYTES} bytes]"
+        ));
+    }
+    if let Some(error) = &body.read_error {
+        text.push_str(&format!("\n[response body incomplete: {error}]"));
+    }
+    text
+}
+
+fn bound_diagnostic(mut text: String) -> String {
+    if text.len() > MAX_ERROR_DIAGNOSTIC_BYTES {
+        let mut end = MAX_ERROR_DIAGNOSTIC_BYTES - 32;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+        text.push_str(" [diagnostic truncated]");
+    }
+    text
 }
 
 pub(super) fn response_body_text(body: &ResponseBody) -> String {
-    let text = redact_secret_text(&String::from_utf8_lossy(&body.bytes));
-    if body.truncated {
-        format!("{text}\n[response body truncated after {MAX_ERROR_RESPONSE_BYTES} bytes]")
+    bound_diagnostic(sanitized_body(body))
+}
+
+pub(super) fn format_stream_error(event: &str, payload: &str) -> String {
+    let body = ResponseBody {
+        bytes: payload.as_bytes().to_vec(),
+        truncated: false,
+        read_error: None,
+    };
+    let diagnostic = response_body_text(&body);
+    if event.is_empty() {
+        format!("Provider reported an in-stream error: {diagnostic}")
     } else {
-        text
+        format!("Provider reported an in-stream error ({event}): {diagnostic}")
     }
 }
 
@@ -91,11 +148,25 @@ pub(super) fn format_response_error(status: StatusCode, body: &ResponseBody) -> 
     response_error_message(status, body)
 }
 
+fn response_error_message(status: StatusCode, body: &ResponseBody) -> String {
+    let body = response_body_text(body);
+    let body = if body.trim().is_empty() {
+        "empty response body"
+    } else {
+        &body
+    };
+    bound_diagnostic(format!(
+        "Provider returned HTTP {}: {body}",
+        status.as_u16()
+    ))
+}
+
 pub(super) struct RetryState {
     policy: RetryPolicy,
     started: Instant,
     attempt: usize,
     last_diagnostic: Option<String>,
+    last_transport_diagnostic: Option<String>,
 }
 
 impl RetryState {
@@ -105,6 +176,7 @@ impl RetryState {
             started: Instant::now(),
             attempt: 1,
             last_diagnostic: None,
+            last_transport_diagnostic: None,
         }
     }
 
@@ -115,60 +187,71 @@ impl RetryState {
         body: &ResponseBody,
         allow_retry: bool,
     ) -> Result<Duration> {
-        let diagnostic = response_error_message(status, body);
-        self.last_diagnostic = Some(diagnostic.clone());
+        self.last_diagnostic = Some(response_error_message(status, body));
+        self.last_transport_diagnostic = None;
 
-        let structured_hint = structured_retry_hint(&body.bytes);
-        let header_retry_after = parse_retry_after_header(headers);
-        let retry_after = header_retry_after.or(structured_hint.delay);
-        let has_retry_signal = header_retry_after.is_some()
-            || structured_hint.explicit
-            || contains_transient_rate_limit_hint(&body.bytes);
+        let required_delay = retry_delay(headers, &body.bytes)
+            .map_err(|reason| self.with_last_diagnostic(anyhow!(reason)))?;
 
-        if let Some(reason) = permanent_failure(&body.bytes, has_retry_signal) {
-            anyhow::bail!("{diagnostic}. {reason}");
+        if let Some(reason) = permanent_failure(status, &body.bytes) {
+            return Err(self.with_last_diagnostic(anyhow!(reason)));
         }
         if !allow_retry || !is_retryable_status(status) {
-            anyhow::bail!("{diagnostic}");
+            return Err(self.with_last_diagnostic(anyhow!(
+                "HTTP {} response was not retried",
+                status.as_u16()
+            )));
+        }
+        if body.truncated || body.read_error.is_some() {
+            return Err(self.with_last_diagnostic(anyhow!(
+                "HTTP {} response body is incomplete; provider retry instructions cannot be determined, so retrying was refused",
+                status.as_u16()
+            )));
         }
 
-        match self.schedule(
-            &format!("HTTP {}", status.as_u16()),
-            retry_after,
-            Some(&diagnostic),
-        ) {
-            Ok(delay) => Ok(delay),
-            Err(err) => Err(self.with_last_diagnostic(err)),
-        }
+        self.schedule(&format!("HTTP {}", status.as_u16()), required_delay)
+            .map_err(|error| self.with_last_diagnostic(error))
     }
 
-    pub(super) fn retry_connection(&mut self) -> Result<Duration> {
-        let diagnostic = self.last_diagnostic.clone();
-        match self.schedule(
-            "connection failure before request submission",
-            None,
-            diagnostic.as_deref(),
-        ) {
-            Ok(delay) => Ok(delay),
-            Err(err) => Err(self.with_last_diagnostic(err)),
-        }
+    pub(super) fn retry_connection(&mut self, error: reqwest::Error) -> Result<Duration> {
+        self.last_transport_diagnostic = Some(format!(
+            "Connection failure before a provider HTTP response was received: {}",
+            error.without_url()
+        ));
+        self.schedule("connection failure before request submission", None)
+            .map_err(|error| self.with_last_diagnostic(error))
     }
 
-    pub(super) fn with_last_diagnostic(&self, err: anyhow::Error) -> anyhow::Error {
-        match &self.last_diagnostic {
-            Some(diagnostic) if !err.to_string().contains(diagnostic) => {
-                anyhow!("{diagnostic}; {err}")
-            }
-            _ => err,
-        }
-    }
-
-    fn schedule(
+    pub(super) fn transport_error(
         &mut self,
-        reason: &str,
-        retry_after: Option<Duration>,
-        diagnostic: Option<&str>,
-    ) -> Result<Duration> {
+        context: &str,
+        error: reqwest::Error,
+    ) -> anyhow::Error {
+        let transport_diagnostic = format!("{context}: {}", error.without_url());
+        self.last_transport_diagnostic = Some(transport_diagnostic.clone());
+        self.with_last_diagnostic(anyhow!("{transport_diagnostic}"))
+    }
+
+    pub(super) fn with_last_diagnostic(&self, error: anyhow::Error) -> anyhow::Error {
+        let message = error.to_string();
+        let mut diagnostics = Vec::new();
+        for diagnostic in [&self.last_diagnostic, &self.last_transport_diagnostic]
+            .into_iter()
+            .flatten()
+        {
+            if !message.contains(diagnostic) {
+                diagnostics.push(diagnostic.as_str());
+            }
+        }
+        if diagnostics.is_empty() {
+            error
+        } else {
+            diagnostics.push(&message);
+            anyhow!(diagnostics.join("\n"))
+        }
+    }
+
+    fn schedule(&mut self, reason: &str, requested_delay: Option<Duration>) -> Result<Duration> {
         if self.attempt >= self.policy.max_attempts {
             anyhow::bail!(
                 "HTTP recovery exhausted after {} attempts ({reason})",
@@ -176,30 +259,29 @@ impl RetryState {
             );
         }
 
-        let delay = self.backoff_delay().max(retry_after.unwrap_or_default());
-        if self.started.elapsed().saturating_add(delay) > self.policy.max_duration {
+        let delay = self
+            .backoff_delay()
+            .max(requested_delay.unwrap_or_default());
+        let remaining = self
+            .policy
+            .max_duration
+            .saturating_sub(self.started.elapsed());
+        if delay > remaining {
             anyhow::bail!(
-                "HTTP recovery stopped after {} attempts because the next delay ({:.2}s) exceeds the maximum retry duration ({:.2}s); {reason}",
+                "HTTP recovery stopped after {} attempts because the next wait ({:.2}s) does not fit the remaining retry admission budget ({:.2}s); {reason}",
                 self.attempt,
                 delay.as_secs_f64(),
-                self.policy.max_duration.as_secs_f64()
+                remaining.as_secs_f64()
             );
         }
 
         self.attempt += 1;
-        let attempt = self.attempt;
-        let max_attempts = self.policy.max_attempts;
-        let delay_secs = delay.as_secs_f64();
-        if let Some(diagnostic) = diagnostic {
-            let diagnostic = diagnostic.chars().take(1_000).collect::<String>();
-            log::warn!(
-                "Provider request failed ({reason}): {diagnostic}; retrying attempt {attempt} of {max_attempts} in {delay_secs:.2}s"
-            );
-        } else {
-            log::warn!(
-                "Provider request failed ({reason}); retrying attempt {attempt} of {max_attempts} in {delay_secs:.2}s"
-            );
-        }
+        log::warn!(
+            "Provider request failed ({reason}); retrying attempt {} of {} in {:.2}s",
+            self.attempt,
+            self.policy.max_attempts,
+            delay.as_secs_f64()
+        );
         Ok(delay)
     }
 
@@ -210,7 +292,7 @@ impl RetryState {
             .saturating_mul(1_u64 << exponent)
             .min(self.policy.max_backoff.as_millis() as u64);
         let lower_ms = upper_ms / 2;
-        let jitter_range = upper_ms.saturating_sub(lower_ms).saturating_add(1);
+        let jitter_range = upper_ms - lower_ms + 1;
         let jitter = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -244,20 +326,22 @@ async fn send_with_retry_policy(builder: RequestBuilder, policy: RetryPolicy) ->
 
         let response = match request.send().await {
             Ok(response) => response,
-            Err(err) if allow_retry && err.is_connect() => {
-                let delay = state.retry_connection()?;
+            Err(error) if allow_retry && error.is_connect() => {
+                let delay = state.retry_connection(error)?;
                 tokio::time::sleep(delay).await;
                 continue;
             }
-            Err(err) if err.is_timeout() => {
-                let error = anyhow!(
-                    "Provider request timed out and was not replayed because the provider may have received it: {}",
-                    err.without_url()
-                );
-                return Err(state.with_last_diagnostic(error));
+            Err(error) if error.is_timeout() => {
+                return Err(state.transport_error(
+                    "Provider request timed out; no HTTP response was received and the request was not replayed because the provider may have received it",
+                    error,
+                ));
             }
-            Err(err) => {
-                return Err(state.with_last_diagnostic(err.without_url().into()));
+            Err(error) => {
+                return Err(state.transport_error(
+                    "Transport failure; no provider HTTP response was received",
+                    error,
+                ));
             }
         };
 
@@ -267,9 +351,7 @@ async fn send_with_retry_policy(builder: RequestBuilder, policy: RetryPolicy) ->
 
         let status = response.status();
         let headers = response.headers().clone();
-        let body = read_response_body(response)
-            .await
-            .map_err(|err| state.with_last_diagnostic(err))?;
+        let body = read_response_body(response).await;
         let delay = state.retry_response(status, &headers, &body, allow_retry)?;
         tokio::time::sleep(delay).await;
     }
@@ -289,373 +371,161 @@ fn parse_retry_after_header(headers: &HeaderMap) -> Option<Duration> {
     }
 
     let retry_at = DateTime::parse_from_rfc2822(value).ok()?.timestamp();
-    let seconds = retry_at.saturating_sub(Utc::now().timestamp());
-    Some(Duration::from_secs(seconds.max(0) as u64))
-}
-
-#[derive(Default)]
-struct StructuredRetryHint {
-    explicit: bool,
-    delay: Option<Duration>,
-}
-
-fn structured_retry_hint(body: &[u8]) -> StructuredRetryHint {
-    fn visit(value: &Value, retry_info: bool, hint: &mut StructuredRetryHint) {
-        match value {
-            Value::Object(object) => {
-                let is_retry_info = retry_info
-                    || object
-                        .get("@type")
-                        .and_then(Value::as_str)
-                        .is_some_and(|value| value.ends_with("google.rpc.RetryInfo"));
-                if is_retry_info {
-                    hint.explicit = true;
-                }
-
-                for (key, value) in object {
-                    let key = key.to_ascii_lowercase().replace(['_', '-'], "");
-                    if key == "retryinfo" {
-                        hint.explicit = true;
-                    } else if matches!(key.as_str(), "retrydelay" | "retryafter") {
-                        hint.explicit = true;
-                        if hint.delay.is_none() {
-                            hint.delay = parse_retry_delay(value);
-                        }
-                    }
-                    visit(value, is_retry_info, hint);
-                }
-            }
-            Value::Array(values) => {
-                for value in values {
-                    visit(value, retry_info, hint);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    let mut hint = StructuredRetryHint::default();
-    if let Ok(value) = serde_json::from_slice::<Value>(body) {
-        visit(&value, false, &mut hint);
-    }
-    hint
-}
-
-fn parse_retry_delay(value: &Value) -> Option<Duration> {
-    let seconds = match value {
-        Value::Number(number) => number.as_f64()?,
-        Value::String(value) => {
-            let value = value.trim();
-            if let Some(value) = value.strip_suffix("ms") {
-                value.parse::<f64>().ok()? / 1_000.0
-            } else if let Some(value) = value.strip_suffix('s') {
-                value.parse::<f64>().ok()?
-            } else {
-                value.parse::<f64>().ok()?
-            }
-        }
-        _ => return None,
-    };
-    if !seconds.is_finite() || seconds < 0.0 {
-        return None;
-    }
-    Some(Duration::from_secs_f64(
-        seconds.min(MAX_CONFIGURED_DURATION_SECS as f64 + 1.0),
+    Some(Duration::from_secs(
+        retry_at.saturating_sub(Utc::now().timestamp()).max(0) as u64,
     ))
 }
 
-fn contains_transient_rate_limit_hint(body: &[u8]) -> bool {
-    let text = String::from_utf8_lossy(body).to_ascii_lowercase();
-    [
-        "rate_limit",
-        "rate limit",
-        "perminute",
-        "per_minute",
-        "per minute",
-        "per second",
-        "per-second",
-        "requests per minute",
-    ]
-    .iter()
-    .any(|value| text.contains(value))
-}
-
-fn has_exhausted_period_quota(text: &str) -> bool {
-    const PERIOD_QUOTA_TERMS: &[&str] = &[
-        "daily quota",
-        "monthly quota",
-        "daily request quota",
-        "monthly request quota",
-        "daily quota limit",
-        "monthly quota limit",
-        "daily limit",
-        "monthly limit",
-        "daily request limit",
-        "monthly request limit",
-        "per-day quota",
-        "per-month quota",
-        "per-day limit",
-        "per-month limit",
-        "per day quota",
-        "per month quota",
-        "per day limit",
-        "per month limit",
-        "daily allowance",
-        "monthly allowance",
-        "daily usage limit",
-        "monthly usage limit",
-        "quota per day",
-        "quota per month",
-        "limit per day",
-        "limit per month",
-        "quota for today",
-        "quota for this day",
-        "quota for this month",
-        "limit for today",
-        "limit for this day",
-        "limit for this month",
-    ];
-    const EXHAUSTION_PREFIXES: &[&str] = &[
-        "exceeded ",
-        "exceeded your ",
-        "exceeded the ",
-        "exceeded a ",
-        "exhausted ",
-        "exhausted your ",
-        "exhausted the ",
-        "exhausted all of your ",
-        "reached ",
-        "reached your ",
-        "reached the ",
-        "depleted ",
-        "depleted your ",
-        "depleted the ",
-        "hit ",
-        "hit your ",
-        "hit the ",
-        "used up ",
-        "used all of your ",
-    ];
-    const EXHAUSTION_SUFFIXES: &[&str] = &[
-        " exhausted",
-        " is exhausted",
-        " was exhausted",
-        " has been exhausted",
-        " fully exhausted",
-        " is fully exhausted",
-        " has been fully exhausted",
-        " exceeded",
-        " is exceeded",
-        " was exceeded",
-        " has been exceeded",
-        " reached",
-        " is reached",
-        " was reached",
-        " has been reached",
-        " depleted",
-        " is depleted",
-        " was depleted",
-        " has been depleted",
-        " used up",
-        " is used up",
-        " has been used up",
-        " maxed out",
-        " is maxed out",
-        " has been maxed out",
-        " has run out",
-        " ran out",
-    ];
-
-    PERIOD_QUOTA_TERMS.iter().any(|term| {
-        EXHAUSTION_PREFIXES
-            .iter()
-            .any(|prefix| text.contains(&format!("{prefix}{term}")))
-            || EXHAUSTION_SUFFIXES
-                .iter()
-                .any(|suffix| text.contains(&format!("{term}{suffix}")))
-    })
-}
-
-fn permanent_failure(body: &[u8], has_retry_hint: bool) -> Option<&'static str> {
-    let text = String::from_utf8_lossy(body).to_ascii_lowercase();
-    let has_retry_hint = has_retry_hint || contains_transient_rate_limit_hint(body);
-
-    let permanent = [
-        "insufficient_quota",
-        "billing_hard_limit_reached",
-        "billing_not_active",
-        "billing disabled",
-        "billing error",
-        "billing_error",
-        "billing_limit_exceeded",
-        "insufficient_credits",
-        "credit_limit_exceeded",
-        "payment_required",
-        "payment required",
-        "credit balance is too low",
-        "account_deactivated",
-        "account is deactivated",
-        "invalid_api_key",
-        "authentication_error",
-        "invalid authentication",
-        "invalid_request_error",
-    ];
-    if permanent.iter().any(|value| text.contains(value)) {
-        return Some(
-            "Check the provider's billing status, quota, credentials, and request configuration",
-        );
+fn parse_google_duration(value: &str) -> Option<Duration> {
+    let value = value.strip_suffix('s')?;
+    let (seconds, fraction) = value.split_once('.').unwrap_or((value, ""));
+    if seconds.is_empty()
+        || !seconds.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+        || (value.contains('.') && fraction.is_empty())
+        || fraction.len() > 9
+    {
+        return None;
     }
 
-    let hard_exhausted_quota = [
-        "permanent quota",
-        "quota is exhausted",
-        "quota has been exhausted",
-        "quota exhausted",
-        "quota is depleted",
-        "quota has been depleted",
-        "quota depleted",
-        "no remaining quota",
-        "no quota remaining",
-        "no quota left",
-        "out of quota",
-    ]
-    .iter()
-    .any(|value| text.contains(value))
-        || has_exhausted_period_quota(&text);
-    if hard_exhausted_quota {
-        return Some(
-            "The provider reports an exhausted quota; check its quota limits or billing settings",
-        );
+    let seconds = seconds.parse::<u64>().ok()?;
+    if seconds > 315_576_000_000 {
+        return None;
     }
-
-    let ambiguous_quota = [
-        "servicequotaexceeded",
-        "quotaexceededexception",
-        "quota_exceeded",
-        "quota exceeded",
-        "quota has been exceeded",
-        "exceeded your current quota",
-    ]
-    .iter()
-    .any(|value| text.contains(value));
-
-    if ambiguous_quota && !has_retry_hint {
-        Some("The provider reports an exhausted quota; check its quota limits or billing settings")
+    let nanos = if fraction.is_empty() {
+        0
     } else {
-        None
+        format!("{fraction:0<9}").parse::<u32>().ok()?
+    };
+    if seconds == 315_576_000_000 && nanos > 0 {
+        return None;
+    }
+    Duration::from_secs(seconds).checked_add(Duration::from_nanos(u64::from(nanos)))
+}
+
+fn google_error_details(data: &Value) -> Vec<&Value> {
+    if let Some(details) = data
+        .pointer("/error/details")
+        .or_else(|| data.get("details"))
+        .and_then(Value::as_array)
+    {
+        return details.iter().collect();
+    }
+
+    let Some(envelopes) = data.as_array() else {
+        return Vec::new();
+    };
+    let wrapped_details = envelopes
+        .iter()
+        .filter_map(|envelope| envelope.pointer("/error/details").and_then(Value::as_array))
+        .flatten()
+        .collect::<Vec<_>>();
+
+    if wrapped_details.is_empty() {
+        envelopes.iter().collect()
+    } else {
+        wrapped_details
     }
 }
 
-fn response_error_message(status: StatusCode, body: &ResponseBody) -> String {
-    let body_text = redact_secret_text(&String::from_utf8_lossy(&body.bytes));
-    let mut diagnostic = match serde_json::from_slice::<Value>(&body.bytes) {
-        Ok(mut data) => {
-            redact_json_secrets(&mut data);
-            let message = first_string(
-                &data,
-                &[
-                    "/error_description",
-                    "/error/message",
-                    "/message",
-                    "/detail",
-                    "/errors/0/message",
-                    "/errors/0/title",
-                    "/Message",
-                    "/Error/Message",
-                    "/title",
-                ],
-            );
-            let oauth_error = first_string(&data, &["/error"]);
-            let error_uri = first_string(&data, &["/error_uri", "/error/uri"]);
-            let error_hint =
-                first_string(&data, &["/error_hint", "/error_reason", "/error_subtype"]);
-            let error_type = first_string(&data, &["/error/type", "/__type", "/type"]);
-            let code = first_string(
-                &data,
-                &["/error/code", "/code", "/errors/0/code", "/errors/0/reason"],
-            );
-            let provider_status = first_string(&data, &["/error/status", "/status"]);
-            let details = first_value(
-                &data,
-                &[
-                    "/error/details",
-                    "/details",
-                    "/error/innererror",
-                    "/error/inner_error",
-                    "/errors",
-                ],
-            );
-
-            let mut parts = Vec::new();
-            if let Some(message) = message {
-                parts.push(message);
-            }
-            if let Some(oauth_error) = oauth_error {
-                parts.push(format!("error: {oauth_error}"));
-            }
-            if let Some(error_uri) = error_uri {
-                parts.push(format!("error_uri: {error_uri}"));
-            }
-            if let Some(error_hint) = error_hint {
-                parts.push(format!("error hint: {error_hint}"));
-            }
-            if let Some(error_type) = error_type {
-                parts.push(format!("type: {error_type}"));
-            }
-            if let Some(code) = code {
-                parts.push(format!("code: {code}"));
-            }
-            if let Some(provider_status) = provider_status {
-                parts.push(format!("provider status: {provider_status}"));
-            }
-            if let Some(details) = details {
-                if let Ok(details) = serde_json::to_string(details) {
-                    parts.push(format!("details: {details}"));
-                }
-            }
-
-            let response = serde_json::to_string(&data).unwrap_or_else(|_| body_text.clone());
-            if parts.is_empty() {
-                response
-            } else {
-                parts.push(format!("response: {response}"));
-                parts.join("; ")
-            }
-        }
-        Err(_) if body_text.trim().is_empty() => "empty response body".to_string(),
-        Err(_) => body_text,
+fn google_retry_info(body: &[u8]) -> Result<Option<Duration>, &'static str> {
+    let Ok(data) = serde_json::from_slice::<Value>(body) else {
+        return Ok(None);
     };
 
-    if body.truncated {
-        diagnostic.push_str(&format!(
-            " [response body truncated after {MAX_ERROR_RESPONSE_BYTES} bytes]"
-        ));
-    }
-    let mut diagnostic = format!("Provider returned HTTP {}: {diagnostic}", status.as_u16());
-    if diagnostic.len() > MAX_ERROR_DIAGNOSTIC_BYTES {
-        let mut end = MAX_ERROR_DIAGNOSTIC_BYTES;
-        while !diagnostic.is_char_boundary(end) {
-            end -= 1;
+    let mut delay = None;
+    for detail in google_error_details(&data) {
+        if detail.get("@type").and_then(Value::as_str)
+            != Some("type.googleapis.com/google.rpc.RetryInfo")
+        {
+            continue;
         }
-        diagnostic.truncate(end);
-        diagnostic.push_str(" [diagnostic truncated]");
+
+        let retry_delay = detail
+            .get("retryDelay")
+            .and_then(Value::as_str)
+            .and_then(parse_google_duration)
+            .ok_or("recognized google.rpc.RetryInfo has a missing or malformed retryDelay")?;
+        delay = Some(delay.map_or(retry_delay, |current: Duration| current.max(retry_delay)));
     }
-    diagnostic
+
+    Ok(delay)
 }
 
-fn first_string(value: &Value, paths: &[&str]) -> Option<String> {
-    paths.iter().find_map(|path| {
-        let value = value.pointer(path)?;
-        match value {
-            Value::String(value) if !value.trim().is_empty() => Some(value.clone()),
-            Value::Number(value) => Some(value.to_string()),
-            _ => None,
+fn retry_delay(headers: &HeaderMap, body: &[u8]) -> Result<Option<Duration>, &'static str> {
+    let header_delay = parse_retry_after_header(headers);
+    let google_delay = google_retry_info(body)?;
+    Ok(header_delay.into_iter().chain(google_delay).max())
+}
+
+fn google_has_daily_quota(data: &Value) -> bool {
+    const DAILY_QUOTA_IDS: &[&str] = &[
+        "GenerateRequestsPerDayPerProjectPerModel-FreeTier",
+        "GenerateContentInputTokensPerModelPerDay-FreeTier",
+    ];
+    // Gemini quota failures expose quota IDs such as GenerateRequestsPerDayPerProjectPerModel-FreeTier.
+    google_error_details(data).into_iter().any(|detail| {
+        if detail.get("@type").and_then(Value::as_str)
+            != Some("type.googleapis.com/google.rpc.QuotaFailure")
+        {
+            return false;
         }
+        detail
+            .get("violations")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|violation| violation.get("quotaId").and_then(Value::as_str))
+            .any(|quota_id| DAILY_QUOTA_IDS.contains(&quota_id))
     })
 }
 
-fn first_value<'a>(value: &'a Value, paths: &[&str]) -> Option<&'a Value> {
-    paths.iter().find_map(|path| value.pointer(path))
+fn permanent_failure(status: StatusCode, body: &[u8]) -> Option<&'static str> {
+    if status != StatusCode::TOO_MANY_REQUESTS {
+        return None;
+    }
+    let data = serde_json::from_slice::<Value>(body).ok()?;
+    const QUOTA_CODES: &[&str] = &[
+        "insufficient_quota",
+        "billing_hard_limit_reached",
+        "credit_balance_exhausted",
+        "organization_usage_limit_exceeded",
+        "organization_spend_limit_exceeded",
+        "project_spend_limit_exceeded",
+    ];
+    const AUTH_CODES: &[&str] = &["invalid_api_key", "authentication_error", "invalid_grant"];
+    let code_paths = [
+        "/error/code",
+        "/error/type",
+        "/error",
+        "/code",
+        "/type",
+        "/Error/Code",
+        "/__type",
+        "/errors/0/code",
+        "/errors/0/reason",
+    ];
+
+    let has_code = |codes: &[&str]| {
+        code_paths.iter().any(|path| {
+            data.pointer(path)
+                .and_then(Value::as_str)
+                .is_some_and(|actual| codes.iter().any(|code| actual.eq_ignore_ascii_case(code)))
+        })
+    };
+
+    if has_code(QUOTA_CODES) {
+        return Some("The provider reports a permanent billing or usage limit; check its billing and quota settings");
+    }
+    if has_code(AUTH_CODES) {
+        return Some(
+            "The provider rejected the request credentials; check the authentication configuration",
+        );
+    }
+    if google_has_daily_quota(&data) {
+        return Some("Google reports a documented daily quota violation; retrying within the configured window is unlikely to help");
+    }
+    None
 }
 
 fn redact_json_secrets(value: &mut Value) {
@@ -669,7 +539,7 @@ fn redact_json_secrets(value: &mut Value) {
                     .collect::<String>();
                 let sensitive = matches!(
                     key.as_str(),
-                    "key" | "apikey" | "authorization" | "token" | "credential"
+                    "apikey" | "authorization" | "token" | "credential"
                 ) || key.contains("apikey")
                     || key.contains("accesstoken")
                     || key.contains("accesskey")
@@ -704,7 +574,10 @@ fn redact_secret_text(value: &str) -> String {
     for prefix in ["sk-", "AIza", "AKIA", "xoxb-", "xoxp-", "xoxa-"] {
         value = redact_prefixed_token(&value, prefix);
     }
-    value.chars().filter(|value| !value.is_control()).collect()
+    value
+        .chars()
+        .filter(|value| !value.is_control() || matches!(*value, '\n' | '\r' | '\t'))
+        .collect()
 }
 
 fn redact_assignment_values(input: &str) -> String {
@@ -741,7 +614,6 @@ fn redact_assignment_values(input: &str) -> String {
         "credential",
         "secret",
         "token",
-        "key",
     ];
     let mut value = input.to_string();
     let mut cursor = 0;
@@ -898,6 +770,7 @@ mod tests {
         content_type: &'static str,
         body: String,
         delay: Duration,
+        content_length: Option<usize>,
     }
 
     impl MockResponse {
@@ -908,6 +781,7 @@ mod tests {
                 content_type: "application/json",
                 body: body.to_string(),
                 delay: Duration::ZERO,
+                content_length: None,
             }
         }
 
@@ -918,6 +792,7 @@ mod tests {
                 content_type: "text/event-stream",
                 body: body.to_string(),
                 delay: Duration::ZERO,
+                content_length: None,
             }
         }
 
@@ -928,6 +803,11 @@ mod tests {
 
         fn delay(mut self, delay: Duration) -> Self {
             self.delay = delay;
+            self
+        }
+
+        fn disconnect_after_body(mut self) -> Self {
+            self.content_length = Some(self.body.len() + 32);
             self
         }
     }
@@ -965,6 +845,7 @@ mod tests {
                 }
 
                 let body = response.body.into_bytes();
+                let content_length = response.content_length.unwrap_or(body.len());
                 let reason = match response.status {
                     200 => "OK",
                     429 => "Too Many Requests",
@@ -979,7 +860,7 @@ mod tests {
                     "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nContent-Type: {}\r\nConnection: close\r\n",
                     response.status,
                     reason,
-                    body.len(),
+                    content_length,
                     response.content_type
                 );
                 for (name, value) in response.headers {
@@ -1089,6 +970,7 @@ mod tests {
             let body = ResponseBody {
                 bytes: bytes.to_vec(),
                 truncated: false,
+                read_error: None,
             };
             let diagnostic = format_response_error(StatusCode::TOO_MANY_REQUESTS, &body);
             for value in expected {
@@ -1100,10 +982,20 @@ mod tests {
         let body = ResponseBody {
             bytes: raw.to_vec(),
             truncated: false,
+            read_error: None,
         };
         let diagnostic = format_response_error(StatusCode::BAD_GATEWAY, &body);
         assert!(diagnostic.contains("HTTP 502"));
         assert!(diagnostic.contains("gateway said unavailable"));
+
+        let raw_json = b"{\n  \"error\": {\n    \"message\": \"provider detail\",\n    \"code\": \"rate_limit_exceeded\"\n  }\n}";
+        let body = ResponseBody {
+            bytes: raw_json.to_vec(),
+            truncated: false,
+            read_error: None,
+        };
+        let diagnostic = format_response_error(StatusCode::TOO_MANY_REQUESTS, &body);
+        assert!(diagnostic.contains(std::str::from_utf8(raw_json).unwrap()));
     }
 
     #[test]
@@ -1111,6 +1003,7 @@ mod tests {
         let body = ResponseBody {
             bytes: br#"{"error":"invalid_grant","error_description":"The refresh token has expired or been revoked. Re-authorize the account.","error_uri":"https://developers.google.com/identity/protocols/oauth2","error_hint":"Reconnect the Google account","request_id":"oauth-request-123","provider_detail":"Contact support with this request ID","client_secret":"oauth-test-secret"}"#.to_vec(),
             truncated: false,
+            read_error: None,
         };
 
         let diagnostic = format_response_error(StatusCode::BAD_REQUEST, &body);
@@ -1133,32 +1026,43 @@ mod tests {
     #[test]
     fn redacts_credentials_from_json_and_unparsed_error_bodies() {
         let json_body = ResponseBody {
-            bytes: br#"{"service":{"api_key":"json-secret-key","refresh_token":"refresh-secret","note":"Authorization: Bearer header-secret"}}"#.to_vec(),
+            bytes: br#"{"service":{"api_key":"json-secret-key","refresh_token":"refresh-secret","note":"Authorization: Bearer header-secret","key":"provider-diagnostic-key","request_id":"request-123"}}"#.to_vec(),
             truncated: false,
+            read_error: None,
         };
         let diagnostic = format_response_error(StatusCode::BAD_REQUEST, &json_body);
         for secret in ["json-secret-key", "refresh-secret", "header-secret"] {
             assert!(!diagnostic.contains(secret), "{diagnostic}");
         }
         assert!(diagnostic.contains("[REDACTED]"));
+        assert!(diagnostic.contains("provider-diagnostic-key"));
+        assert!(diagnostic.contains("request-123"));
 
         let raw_body = ResponseBody {
             bytes: b"upstream echoed Authorization: Bearer plain-secret-token, api_key=other-secret, API key: freeform-secret"
                 .to_vec(),
             truncated: false,
+            read_error: None,
         };
         let diagnostic = format_response_error(StatusCode::BAD_GATEWAY, &raw_body);
         for secret in ["plain-secret-token", "other-secret", "freeform-secret"] {
             assert!(!diagnostic.contains(secret), "{diagnostic}");
         }
+
+        let truncated = ResponseBody {
+            bytes: vec![b'x'; MAX_ERROR_RESPONSE_BYTES],
+            truncated: true,
+            read_error: None,
+        };
+        let diagnostic = format_response_error(StatusCode::BAD_GATEWAY, &truncated);
+        assert!(diagnostic.contains("response body truncated after 65536 bytes"));
     }
 
     #[tokio::test]
-    async fn does_not_retry_daily_or_monthly_quotas_with_generic_retry_wording() {
+    async fn quota_mentions_without_structured_permanent_evidence_remain_retryable() {
         for body in [
             r#"{"error":{"message":"You have exceeded your daily quota. Try again tomorrow."}}"#,
             r#"{"error":{"message":"Daily quota has been exceeded. Retry in 24 hours."}}"#,
-            r#"{"error":{"message":"You have exceeded the quota for this month. Try again next month."}}"#,
             r#"{"error":{"message":"Monthly limit exceeded. Please retry after renewal."}}"#,
         ] {
             let (url, requests, server) = spawn_server(vec![
@@ -1166,24 +1070,20 @@ mod tests {
                 MockResponse::json(200, r#"{"ok":true}"#),
             ])
             .await;
-            let error =
+            let response =
                 send_with_retry_policy(post(&reqwest::Client::new(), &url), quick_policy(3))
                     .await
-                    .unwrap_err();
+                    .unwrap();
 
-            assert!(error.to_string().contains("HTTP 429"), "{error}");
-            assert_eq!(
-                requests.load(Ordering::SeqCst),
-                1,
-                "period quota response was retried: {body}"
-            );
-            server.abort();
+            assert!(response.status().is_success(), "{body}");
+            assert_eq!(requests.load(Ordering::SeqCst), 2, "{body}");
+            server.await.unwrap();
         }
     }
 
     #[tokio::test]
     async fn retries_gemini_quota_error_with_nested_google_retry_info() {
-        let body = r#"{"error":{"code":429,"message":"You exceeded your current quota for this request","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"0.08s"}]}}"#;
+        let body = r#"{"error":{"code":429,"message":"You exceeded your current quota for this request","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{"quotaId":"GenerateRequestsPerMinutePerProjectPerModel-FreeTier"}]},{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"0.08s"}]}}"#;
         let (url, requests, server) = spawn_server(vec![
             MockResponse::json(429, body),
             MockResponse::json(200, r#"{"ok":true}"#),
@@ -1242,6 +1142,60 @@ mod tests {
             "{}",
             error.len()
         );
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn refuses_retry_when_google_retry_info_is_beyond_diagnostic_limit() {
+        let body = format!(
+            r#"{{"error":{{"message":"{}","details":[{{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"120s"}}]}}}}"#,
+            "x".repeat(MAX_ERROR_RESPONSE_BYTES)
+        );
+        assert!(
+            body.find("\"retryDelay\"").unwrap() > MAX_ERROR_RESPONSE_BYTES,
+            "RetryInfo must be beyond the retained response-body prefix"
+        );
+
+        let (url, requests, server) = spawn_server(vec![MockResponse::json(429, &body)]).await;
+        let error = send_with_retry_policy(post(&reqwest::Client::new(), &url), quick_policy(3))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("HTTP 429"), "{error}");
+        assert!(
+            error.contains("response body truncated after 65536 bytes"),
+            "{error}"
+        );
+        assert!(
+            error.contains("provider retry instructions cannot be determined"),
+            "{error}"
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn preserves_partial_provider_body_when_response_read_fails() {
+        let body =
+            r#"{"error":{"message":"partial provider diagnostic","api_key":"partial-secret""#;
+        let (url, requests, server) =
+            spawn_server(vec![MockResponse::json(429, body).disconnect_after_body()]).await;
+        let error = send_with_retry_policy(post(&reqwest::Client::new(), &url), quick_policy(3))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        for expected in [
+            "HTTP 429",
+            "partial provider diagnostic",
+            "response body incomplete",
+            "Failed to read provider error response (HTTP 429)",
+        ] {
+            assert!(error.contains(expected), "{error} missing {expected}");
+        }
+        assert!(!error.contains("partial-secret"), "{error}");
         assert_eq!(requests.load(Ordering::SeqCst), 1);
         server.await.unwrap();
     }
@@ -1400,81 +1354,96 @@ mod tests {
         server.await.unwrap();
     }
 
+    const CAPTURED_GEMINI_RATE_LIMIT: &str = r#"[{"error":{"code":429,"message":"You exceeded your current quota, please check your plan and billing details. For more information on this error, head to: https://aistudio.google.com/docs/rate-limits. To monitor your current usage, head to: https://ai.dev/rate-limit. * Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_requests, limit: 15, model: gemini-3.5-flash-lite, description: Generate content requests per minute limit exceeded on Free Tier. See https://aistudio.google.com/docs/rate-limits.Please retry in 59.599883052s.","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.Help","links":[{"description":"Learn more about Gemini API quotas","url":"https://aistudio.google.com/docs/rate-limits"}]},{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{"description":"Generate content requests per minute limit exceeded on Free Tier. See https://aistudio.google.com/docs/rate-limits.","quotaMetric":"generativelanguage.googleapis.com/generate_content_free_tier_requests","quotaId":"GenerateRequestsPerMinutePerProjectPerModel-FreeTier","quotaDimensions":{"model":"gemini-3.5-flash-lite","location":"global"},"quotaValue":"15"}]},{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"59s"}]}}]"#;
+
+    fn production_default_policy() -> RetryPolicy {
+        RetryPolicy {
+            max_attempts: DEFAULT_MAX_ATTEMPTS,
+            max_duration: Duration::from_secs(DEFAULT_MAX_DURATION_SECS),
+            base_delay: Duration::from_millis(BASE_DELAY_MS),
+            max_backoff: Duration::from_millis(MAX_BACKOFF_MS),
+        }
+    }
+
     #[test]
-    fn identifies_permanent_quota_errors_and_retry_after_values() {
-        assert!(permanent_failure(br#"{"error":{"code":"insufficient_quota"}}"#, false).is_some());
-        assert!(permanent_failure(br#"{"error":{"type":"billing_error"}}"#, false).is_some());
-        assert!(permanent_failure(br#"{"error":{"reason":"QUOTA_EXCEEDED"}}"#, false).is_some());
-        assert!(permanent_failure(
-            br#"{"error":{"reason":"RATE_LIMIT_EXCEEDED","message":"Quota exceeded per minute"}}"#,
-            false
-        )
-        .is_none());
-        assert!(permanent_failure(br#"{"error":{"message":"Quota exceeded"}}"#, true).is_none());
-        assert!(permanent_failure(
-            br#"{"error":{"code":"ServiceQuotaExceededException"}}"#,
-            false
-        )
-        .is_some());
-        assert!(
-            permanent_failure(br#"{"error":{"code":"QuotaExceededException"}}"#, false).is_some()
+    fn captured_gemini_array_envelope_retries_minute_quota_after_provider_delay() {
+        let body = ResponseBody {
+            bytes: CAPTURED_GEMINI_RATE_LIMIT.as_bytes().to_vec(),
+            truncated: false,
+            read_error: None,
+        };
+        let data: Value = serde_json::from_slice(&body.bytes).unwrap();
+
+        assert!(data.is_array());
+        assert!(!google_has_daily_quota(&data));
+        assert!(permanent_failure(StatusCode::TOO_MANY_REQUESTS, &body.bytes).is_none());
+
+        let mut state = RetryState::new(production_default_policy());
+        let delay = state
+            .retry_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                &HeaderMap::new(),
+                &body,
+                true,
+            )
+            .unwrap();
+
+        assert!(delay >= Duration::from_secs(59), "{delay:?}");
+        assert_eq!(state.attempt, 2);
+    }
+
+    #[test]
+    fn array_wrapped_gemini_daily_quota_remains_permanent() {
+        let body = br#"[{"error":{"code":429,"message":"Daily requests quota exhausted","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{"quotaId":"GenerateRequestsPerDayPerProjectPerModel-FreeTier","description":"daily request cap reached"}]},{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"59s"}]}}]"#;
+        let data: Value = serde_json::from_slice(body).unwrap();
+
+        assert!(google_has_daily_quota(&data));
+        assert!(permanent_failure(StatusCode::TOO_MANY_REQUESTS, body).is_some());
+
+        let response_body = ResponseBody {
+            bytes: body.to_vec(),
+            truncated: false,
+            read_error: None,
+        };
+        let mut state = RetryState::new(production_default_policy());
+        let error = state
+            .retry_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                &HeaderMap::new(),
+                &response_body,
+                true,
+            )
+            .unwrap_err();
+
+        let diagnostic = error.to_string();
+        assert!(diagnostic.contains("daily quota"));
+        assert!(diagnostic.contains("Daily requests quota exhausted"));
+        assert!(diagnostic.contains("GenerateRequestsPerDayPerProjectPerModel-FreeTier"));
+        assert!(diagnostic.contains("daily request cap reached"));
+        assert_eq!(state.attempt, 1);
+    }
+
+    #[test]
+    fn parses_supported_retry_instructions_and_classifies_verified_failures() {
+        let nested = br#"{"error":{"details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"59s"}]}}"#;
+        assert_eq!(
+            google_retry_info(nested).unwrap(),
+            Some(Duration::from_secs(59))
         );
 
-        for body in [
-            br#"{"error":{"message":"Your daily quota is 100 requests."}}"#.as_slice(),
-            br#"{"error":{"message":"Monthly quota is available."}}"#.as_slice(),
-            br#"{"error":{"message":"Your daily limit resets tomorrow."}}"#.as_slice(),
-            br#"{"error":{"message":"Monthly allowance: 500 requests."}}"#.as_slice(),
-            br#"{"error":{"message":"Daily quota available: 20 requests; request rate limit exceeded per minute."}}"#.as_slice(),
-            br#"{"error":{"message":"Monthly limit allows 1,000 requests; per-second rate limit exceeded."}}"#.as_slice(),
-        ] {
-            assert!(
-                permanent_failure(body, false).is_none(),
-                "period quota mention without exhaustion must remain retryable: {}",
-                String::from_utf8_lossy(body)
-            );
-        }
+        let top_level =
+            br#"[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"1.5s"}]"#;
+        assert_eq!(
+            google_retry_info(top_level).unwrap(),
+            Some(Duration::from_millis(1500))
+        );
 
-        for body in [
-            br#"{"error":{"message":"You have exceeded your daily quota."}}"#.as_slice(),
-            br#"{"error":{"message":"Daily quota has been exhausted."}}"#.as_slice(),
-            br#"{"error":{"message":"You have reached your monthly limit."}}"#.as_slice(),
-            br#"{"error":{"message":"No remaining quota for this month."}}"#.as_slice(),
-            br#"{"error":{"message":"You have exceeded your daily quota. Try again tomorrow."}}"#.as_slice(),
-            br#"{"error":{"message":"Daily quota has been exceeded. Retry in 24 hours."}}"#.as_slice(),
-            br#"{"error":{"message":"You have exceeded the quota for this month. Try again next month."}}"#.as_slice(),
-            br#"{"error":{"message":"Monthly limit exceeded. Please retry after renewal."}}"#.as_slice(),
-        ] {
-            assert!(
-                permanent_failure(body, true).is_some(),
-                "period quota must remain permanent: {}",
-                String::from_utf8_lossy(body)
-            );
-        }
-        assert!(
-            permanent_failure(
-                br#"{"error":{"message":"Quota exceeded. Try again in 10 seconds."}}"#,
-                false
-            )
-            .is_some(),
-            "generic retry wording must not convert ambiguous quota exhaustion into a transient error"
-        );
-        assert!(
-            permanent_failure(
-                br#"{"error":{"message":"You exceeded your current quota","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"1s"}]}}"#,
-                true
-            )
-            .is_none(),
-            "structured RetryInfo must still allow a genuinely transient quota response"
-        );
-        assert!(
-            permanent_failure(
-                br#"{"error":{"message":"Quota exceeded per minute"}}"#,
-                false
-            )
-            .is_none(),
-            "rate-limit semantics must remain retryable"
-        );
+        let unrelated =
+            br#"{"metadata":{"retryDelay":"1s"},"error":{"message":"retry later","retryAfter":2}}"#;
+        assert_eq!(google_retry_info(unrelated).unwrap(), None);
+
+        let malformed = br#"{"error":{"details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"later"}]}}"#;
+        assert!(google_retry_info(malformed).is_err());
 
         let mut headers = HeaderMap::new();
         headers.insert(RETRY_AFTER, "2".parse().unwrap());
@@ -1482,17 +1451,146 @@ mod tests {
             parse_retry_after_header(&headers),
             Some(Duration::from_secs(2))
         );
+        let longer_google = br#"{"error":{"details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"3.5s"}]}}"#;
+        assert_eq!(
+            retry_delay(&headers, longer_google).unwrap(),
+            Some(Duration::from_millis(3500))
+        );
+        let longer_header = br#"{"error":{"details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"1s"}]}}"#;
+        assert_eq!(
+            retry_delay(&headers, longer_header).unwrap(),
+            Some(Duration::from_secs(2))
+        );
+
         let date = (Utc::now() + chrono::Duration::seconds(2))
             .format("%a, %d %b %Y %H:%M:%S GMT")
             .to_string();
         headers.insert(RETRY_AFTER, date.parse().unwrap());
         assert!(parse_retry_after_header(&headers).unwrap() >= Duration::from_secs(1));
 
-        let hint = structured_retry_hint(
-            br#"{"error":{"details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"1.5s"}]}}"#,
+        assert!(permanent_failure(
+            StatusCode::TOO_MANY_REQUESTS,
+            br#"{"error":{"type":"insufficient_quota"}}"#
+        )
+        .is_some());
+        assert!(permanent_failure(
+            StatusCode::TOO_MANY_REQUESTS,
+            br#"{"error":{"code":"project_spend_limit_exceeded"}}"#
+        )
+        .is_some());
+        assert!(permanent_failure(
+            StatusCode::TOO_MANY_REQUESTS,
+            br#"{"error":{"code":"invalid_api_key"}}"#
+        )
+        .is_some());
+        assert!(permanent_failure(
+            StatusCode::TOO_MANY_REQUESTS,
+            br#"{"error":{"code":"ServiceQuotaExceededException"}}"#
+        )
+        .is_none());
+        assert!(permanent_failure(
+            StatusCode::TOO_MANY_REQUESTS,
+            br#"{"error":{"message":"Daily quota exceeded; please retry tomorrow"}}"#
+        )
+        .is_none());
+        assert!(permanent_failure(
+            StatusCode::BAD_GATEWAY,
+            br#"{"error":{"type":"insufficient_quota"}}"#
+        )
+        .is_none());
+
+        let google_daily = br#"{"error":{"details":[{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{"quotaId":"GenerateRequestsPerDayPerProjectPerModel-FreeTier"}]},{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"59s"}]}}"#;
+        assert!(permanent_failure(StatusCode::TOO_MANY_REQUESTS, google_daily).is_some());
+        let google_minute = br#"{"error":{"details":[{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{"quotaId":"GenerateRequestsPerMinutePerProjectPerModel-FreeTier"}]}]}}"#;
+        assert!(permanent_failure(StatusCode::TOO_MANY_REQUESTS, google_minute).is_none());
+
+        assert!(is_retryable_status(StatusCode::REQUEST_TIMEOUT));
+        assert!(is_retryable_status(StatusCode::TOO_EARLY));
+        assert!(is_retryable_status(StatusCode::TOO_MANY_REQUESTS));
+    }
+
+    #[test]
+    fn scheduler_accepts_google_delay_and_counts_total_attempts() {
+        assert_eq!(DEFAULT_MAX_ATTEMPTS, 6);
+        assert_eq!(DEFAULT_MAX_DURATION_SECS, 300);
+        assert_eq!(MAX_CONFIGURED_ATTEMPTS, 10);
+        assert_eq!(MAX_CONFIGURED_DURATION_SECS, 300);
+        let policy = RetryPolicy {
+            max_attempts: DEFAULT_MAX_ATTEMPTS,
+            max_duration: Duration::from_secs(DEFAULT_MAX_DURATION_SECS),
+            base_delay: Duration::from_millis(BASE_DELAY_MS),
+            max_backoff: Duration::from_millis(MAX_BACKOFF_MS),
+        };
+
+        let mut three_second_delay = RetryState::new(policy);
+        assert_eq!(
+            three_second_delay
+                .schedule("HTTP 429", Some(Duration::from_secs(3)))
+                .unwrap(),
+            Duration::from_secs(3)
         );
-        assert!(hint.explicit);
-        assert_eq!(hint.delay, Some(Duration::from_millis(1500)));
+
+        let mut long_delay = RetryState::new(policy);
+        assert_eq!(
+            long_delay
+                .schedule("HTTP 429", Some(Duration::from_secs(59)))
+                .unwrap(),
+            Duration::from_secs(59)
+        );
+
+        let mut attempts = RetryState::new(policy);
+        for _ in 0..4 {
+            attempts.schedule("HTTP 429", None).unwrap();
+        }
+        assert_eq!(attempts.attempt, 5);
+        attempts.schedule("HTTP 429", None).unwrap();
+        assert_eq!(attempts.attempt, 6);
+        assert!(attempts.schedule("HTTP 429", None).is_err());
+    }
+
+    #[tokio::test]
+    async fn retries_repeated_429_responses_within_the_attempt_budget() {
+        let responses = vec![
+            MockResponse::json(429, r#"{"error":{"message":"Rate limited"}}"#),
+            MockResponse::json(429, r#"{"error":{"message":"Rate limited"}}"#),
+            MockResponse::json(429, r#"{"error":{"message":"Rate limited"}}"#),
+            MockResponse::json(429, r#"{"error":{"message":"Rate limited"}}"#),
+            MockResponse::json(200, r#"{"ok":true}"#),
+        ];
+        let (url, requests, server) = spawn_server(responses).await;
+        let response = send_with_retry_policy(post(&reqwest::Client::new(), &url), quick_policy(6))
+            .await
+            .unwrap();
+
+        assert!(response.status().is_success());
+        assert_eq!(requests.load(Ordering::SeqCst), 5);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn malformed_google_retry_info_never_falls_back_to_a_shorter_delay() {
+        let body = r#"{"error":{"code":"rate_limit_exceeded","message":"Rate limited","request_id":"malformed-retry-123","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"later"},{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{"quotaId":"GenerateRequestsPerMinutePerProjectPerModel-FreeTier"}]}]}}"#;
+        let (url, requests, server) = spawn_server(vec![
+            MockResponse::json(429, body).header("Retry-After", "0"),
+            MockResponse::json(200, r#"{"ok":true}"#),
+        ])
+        .await;
+        let error = send_with_retry_policy(post(&reqwest::Client::new(), &url), quick_policy(3))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("HTTP 429"), "{error}");
+        assert!(error.contains("malformed retryDelay"), "{error}");
+        assert!(error.contains(r#""retryDelay":"later""#), "{error}");
+        assert!(error.contains("rate_limit_exceeded"), "{error}");
+        assert!(error.contains("malformed-retry-123"), "{error}");
+        assert!(
+            error.contains("GenerateRequestsPerMinutePerProjectPerModel-FreeTier"),
+            "{error}"
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        server.abort();
     }
 
     #[tokio::test]
@@ -1509,7 +1607,9 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(error.to_string().contains("maximum retry duration"));
+        assert!(error.to_string().contains("retry admission budget"));
+        assert!(error.to_string().contains("next wait (1.00s)"));
+        assert!(error.to_string().contains("Rate limit reached"));
         assert_eq!(requests.load(Ordering::SeqCst), 1);
         server.await.unwrap();
     }
@@ -1594,18 +1694,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn does_not_retry_hard_quota_or_billing_failures_with_retry_after() {
+    async fn does_not_retry_verified_billing_auth_or_long_window_quota_failures() {
         let cases = [
-            r#"{"error":{"code":"ServiceQuotaExceededException","message":"Daily quota exhausted","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"1s"}]}}"#,
-            r#"{"error":{"type":"insufficient_quota","message":"You exceeded your current quota","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"1s"}]}}"#,
-            r#"{"error":{"type":"billing_hard_limit_reached","message":"Billing hard limit reached","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"1s"}]}}"#,
-            r#"{"error":{"message":"Monthly quota exhausted","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"1s"}]}}"#,
-            r#"{"error":{"message":"Daily quota exceeded","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"1s"}]}}"#,
-            r#"{"error":{"message":"Monthly request quota exceeded","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"1s"}]}}"#,
-            r#"{"error":{"message":"You have exceeded your daily quota.","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"1s"}]}}"#,
-            r#"{"error":{"message":"Daily quota has been exhausted.","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"1s"}]}}"#,
-            r#"{"error":{"message":"You have reached your monthly limit.","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"1s"}]}}"#,
-            r#"{"error":{"message":"No remaining quota for this month.","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"1s"}]}}"#,
+            r#"{"error":{"type":"insufficient_quota","message":"You exceeded your current quota"}}"#,
+            r#"{"error":{"code":"billing_hard_limit_reached","message":"Billing hard limit reached"}}"#,
+            r#"{"error":{"code":"credit_balance_exhausted","message":"Prepaid credits exhausted"}}"#,
+            r#"{"error":{"code":"organization_spend_limit_exceeded","message":"Organization spend limit reached"}}"#,
+            r#"{"error":{"code":"invalid_api_key","message":"Invalid API key"}}"#,
+            r#"{"error":{"details":[{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{"quotaId":"GenerateRequestsPerDayPerProjectPerModel-FreeTier"}]},{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"1s"}]}}"#,
         ];
         for body in cases {
             let (url, requests, server) = spawn_server(vec![
@@ -1615,12 +1711,39 @@ mod tests {
             let error =
                 send_with_retry_policy(post(&reqwest::Client::new(), &url), quick_policy(4))
                     .await
-                    .unwrap_err();
+                    .unwrap_err()
+                    .to_string();
 
-            assert!(error.to_string().contains("HTTP 429"));
+            assert!(error.contains("HTTP 429"), "{error}");
             assert_eq!(requests.load(Ordering::SeqCst), 1, "{body}");
             server.await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn does_not_replay_non_cloneable_http_requests() {
+        let (url, requests, server) = spawn_server(vec![MockResponse::json(
+            503,
+            r#"{"message":"Temporarily unavailable"}"#,
+        )])
+        .await;
+        let body =
+            reqwest::Body::wrap_stream(futures_util::stream::iter(vec![Ok::<_, std::io::Error>(
+                bytes::Bytes::from_static(b"one-shot body"),
+            )]));
+        let request = reqwest::Client::new()
+            .post(&url)
+            .header("content-type", "application/octet-stream")
+            .body(body);
+        assert!(request.try_clone().is_none());
+
+        let error = send_with_retry_policy(request, quick_policy(4))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("HTTP 503"), "{error}");
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -1672,6 +1795,406 @@ mod tests {
         .unwrap();
 
         assert_eq!(delivered, vec!["partial-output"]);
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        server.await.unwrap();
+    }
+    #[test]
+    fn retry_admission_budget_preserves_a_provider_requested_three_second_wait() {
+        let body = ResponseBody {
+            bytes: br#"{"error":{"code":"rate_limit_exceeded","message":"provider rate limit","details":[{"request_id":"budget-error-123"}]}}"#.to_vec(),
+            truncated: false,
+            read_error: None,
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_AFTER, "3".parse().unwrap());
+        let mut policy = quick_policy(4);
+        policy.max_duration = Duration::from_millis(100);
+        let mut state = RetryState::new(policy);
+        let error = state
+            .retry_response(StatusCode::TOO_MANY_REQUESTS, &headers, &body, true)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("next wait (3.00s)"), "{error}");
+        assert!(
+            error.contains("remaining retry admission budget"),
+            "{error}"
+        );
+        assert!(error.contains("provider rate limit"), "{error}");
+        assert!(error.contains("rate_limit_exceeded"), "{error}");
+        assert!(error.contains("budget-error-123"), "{error}");
+        assert_eq!(state.attempt, 1);
+    }
+
+    #[tokio::test]
+    async fn preserves_latest_provider_response_when_attempts_are_exhausted() {
+        let first = r#"{"error":{"message":"first provider response"}}"#;
+        let latest = r#"{"error":{"code":"rate_limit_exceeded","message":"latest provider response","details":[{"request_id":"latest-request-456","quota":"per-minute"}]}}"#;
+        let (url, requests, server) = spawn_server(vec![
+            MockResponse::json(429, first).header("Retry-After", "0"),
+            MockResponse::json(429, latest).header("Retry-After", "0"),
+        ])
+        .await;
+        let error = send_with_retry_policy(post(&reqwest::Client::new(), &url), quick_policy(2))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("HTTP 429"), "{error}");
+        assert!(error.contains("latest provider response"), "{error}");
+        assert!(error.contains("rate_limit_exceeded"), "{error}");
+        assert!(error.contains("latest-request-456"), "{error}");
+        assert!(error.contains("per-minute"), "{error}");
+        assert!(
+            error.contains("HTTP recovery exhausted after 2 attempts"),
+            "{error}"
+        );
+        assert!(!error.contains("first provider response"), "{error}");
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn preserves_provider_response_when_a_retry_fails_at_transport_layer() {
+        let body = r#"{"error":{"code":"rate_limit_exceeded","message":"provider asked us to retry","details":[{"request_id":"transport-followup-789","quota":"minute-limit"}]}}"#;
+        let (url, requests, server) = spawn_server(vec![
+            MockResponse::json(429, body).header("Retry-After", "0")
+        ])
+        .await;
+        let error = send_with_retry_policy(post(&reqwest::Client::new(), &url), quick_policy(2))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("HTTP 429"), "{error}");
+        assert!(error.contains("provider asked us to retry"), "{error}");
+        assert!(error.contains("rate_limit_exceeded"), "{error}");
+        assert!(error.contains("transport-followup-789"), "{error}");
+        assert!(error.contains("minute-limit"), "{error}");
+        assert!(
+            error.contains("Connection failure before a provider HTTP response was received"),
+            "{error}"
+        );
+        assert!(
+            error.contains("HTTP recovery exhausted after 2 attempts"),
+            "{error}"
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sse_handshake_failure_preserves_provider_response_and_transport_error() {
+        let body = r#"{"error":{"code":"overloaded_error","message":"stream handshake rejected","details":[{"request_id":"sse-handshake-321","reason":"upstream busy"}]}}"#;
+        let (url, requests, server) = spawn_server(vec![
+            MockResponse::json(503, body).header("Retry-After", "0")
+        ])
+        .await;
+        let error = super::super::stream::sse_stream_with_policy(
+            post(&reqwest::Client::new(), &url),
+            |_| Ok(false),
+            quick_policy(2),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("HTTP 503"), "{error}");
+        assert!(error.contains("stream handshake rejected"), "{error}");
+        assert!(error.contains("overloaded_error"), "{error}");
+        assert!(error.contains("sse-handshake-321"), "{error}");
+        assert!(error.contains("upstream busy"), "{error}");
+        assert!(
+            error.contains("Connection failure before a provider HTTP response was received"),
+            "{error}"
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        server.await.unwrap();
+    }
+
+    fn test_stream_handler() -> (
+        crate::client::SseHandler,
+        tokio::sync::mpsc::UnboundedReceiver<crate::client::SseEvent>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (
+            crate::client::SseHandler::new(tx, crate::utils::AbortSignalInner::new()),
+            rx,
+        )
+    }
+
+    #[tokio::test]
+    async fn anthropic_stream_error_preserves_details_redacts_secrets_and_never_replays() {
+        let body = concat!(
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"partial output\"}}\n\n",
+            "event: error\n",
+            "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Claude is overloaded\",\"request_id\":\"req-claude-123\",\"provider_detail\":\"upstream capacity exhausted\",\"api_key\":\"anthropic-test-secret\"}}\n\n"
+        );
+        let (url, requests, server) = spawn_server(vec![MockResponse::sse(body)]).await;
+        let (mut handler, _rx) = test_stream_handler();
+        let error = super::super::claude::claude_chat_completions_streaming(
+            post(&reqwest::Client::new(), &url),
+            &mut handler,
+            &crate::client::Model::new("claude", "claude-sonnet"),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        for expected in [
+            "in-stream error (error)",
+            "overloaded_error",
+            "Claude is overloaded",
+            "req-claude-123",
+            "upstream capacity exhausted",
+        ] {
+            assert!(error.contains(expected), "{error} missing {expected}");
+        }
+        assert!(!error.contains("anthropic-test-secret"), "{error}");
+        assert!(error.contains("[REDACTED]"), "{error}");
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn anthropic_normal_content_reasoning_and_tool_events_are_preserved() {
+        let body = concat!(
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"thinking\":\"checking the result\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\"}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"answer\"}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"tool_use\",\"name\":\"lookup\",\"id\":\"tool-1\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"partial_json\":\"{\\\"query\\\":\\\"rust\\\"}\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\"}\n\n"
+        );
+        let (url, requests, server) = spawn_server(vec![MockResponse::sse(body)]).await;
+        let (mut handler, _rx) = test_stream_handler();
+        super::super::claude::claude_chat_completions_streaming(
+            post(&reqwest::Client::new(), &url),
+            &mut handler,
+            &crate::client::Model::new("claude", "claude-sonnet"),
+        )
+        .await
+        .unwrap();
+
+        let (text, calls) = handler.take();
+        assert!(
+            text.contains("<think>\nchecking the result\n</think>"),
+            "{text}"
+        );
+        assert!(text.contains("answer"), "{text}");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "lookup");
+        assert_eq!(calls[0].arguments, json!({"query": "rust"}));
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn openai_stream_error_envelope_preserves_details_redacts_secrets_and_never_replays() {
+        let body = "data: {\"error\":{\"type\":\"rate_limit_error\",\"code\":\"rate_limit_exceeded\",\"message\":\"OpenAI stream rate limited\",\"request_id\":\"req-openai-456\",\"api_key\":\"openai-test-secret\"}}\n\n";
+        let (url, requests, server) = spawn_server(vec![MockResponse::sse(body)]).await;
+        let (mut handler, _rx) = test_stream_handler();
+        let error = super::super::openai::openai_chat_completions_streaming(
+            post(&reqwest::Client::new(), &url),
+            &mut handler,
+            &crate::client::Model::new("openai", "gpt-test"),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        for expected in [
+            "rate_limit_error",
+            "rate_limit_exceeded",
+            "OpenAI stream rate limited",
+            "req-openai-456",
+        ] {
+            assert!(error.contains(expected), "{error} missing {expected}");
+        }
+        assert!(!error.contains("openai-test-secret"), "{error}");
+        assert!(error.contains("[REDACTED]"), "{error}");
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn openai_normal_content_reasoning_and_tool_events_are_preserved() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"planning\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"query\\\":\\\"rust\\\"}\"}}]}}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (url, requests, server) = spawn_server(vec![MockResponse::sse(body)]).await;
+        let (mut handler, _rx) = test_stream_handler();
+        super::super::openai::openai_chat_completions_streaming(
+            post(&reqwest::Client::new(), &url),
+            &mut handler,
+            &crate::client::Model::new("openai", "gpt-test"),
+        )
+        .await
+        .unwrap();
+
+        let (text, calls) = handler.take();
+        assert!(text.contains("<think>\nplanning\n</think>"), "{text}");
+        assert!(text.contains("answer"), "{text}");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "lookup");
+        assert_eq!(calls[0].arguments, json!({"query": "rust"}));
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn gemini_stream_error_envelope_preserves_details_redacts_secrets_and_never_replays() {
+        let body = r#"[{"error":{"code":429,"message":"Gemini quota exhausted","status":"RESOURCE_EXHAUSTED","details":[{"reason":"per-minute quota"}],"api_key":"gemini-test-secret"}}]"#;
+        let (url, requests, server) = spawn_server(vec![MockResponse::json(200, body)]).await;
+        let (mut handler, _rx) = test_stream_handler();
+        let error = super::super::vertexai::gemini_chat_completions_streaming(
+            post(&reqwest::Client::new(), &url),
+            &mut handler,
+            &crate::client::Model::new("gemini", "gemini-test"),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        for expected in [
+            "in-stream error (error)",
+            "Gemini quota exhausted",
+            "RESOURCE_EXHAUSTED",
+            "per-minute quota",
+        ] {
+            assert!(error.contains(expected), "{error} missing {expected}");
+        }
+        assert!(!error.contains("gemini-test-secret"), "{error}");
+        assert!(error.contains("[REDACTED]"), "{error}");
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn bedrock_stream_exception_diagnostics_are_redacted_without_losing_provider_details() {
+        let error = format_stream_error(
+            "modelStreamErrorException",
+            r#"{"originalStatusCode":429,"originalMessage":"Model overloaded; retry later","requestId":"bedrock-789","secret":"bedrock-test-secret"}"#,
+        );
+
+        for expected in [
+            "modelStreamErrorException",
+            "429",
+            "Model overloaded; retry later",
+            "bedrock-789",
+        ] {
+            assert!(error.contains(expected), "{error} missing {expected}");
+        }
+        assert!(!error.contains("bedrock-test-secret"), "{error}");
+        assert!(error.contains("[REDACTED]"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn cohere_message_end_error_preserves_details_redacts_secrets_and_never_replays() {
+        let body = concat!(
+            "event: content-delta\n",
+            "data: {\"type\":\"content-delta\",\"delta\":{\"message\":{\"content\":{\"text\":\"partial response\"}}}}\n\n",
+            "event: message-end\n",
+            "data: {\"type\":\"message-end\",\"delta\":{\"finish_reason\":\"ERROR\",\"usage\":{\"billed_units\":{\"output_tokens\":7}}},\"request_id\":\"cohere-error-123\",\"details\":{\"message\":\"inference worker terminated\"},\"api_key\":\"cohere-test-secret\"}\n\n"
+        );
+        let (url, requests, server) = spawn_server(vec![MockResponse::sse(body)]).await;
+        let (mut handler, _rx) = test_stream_handler();
+        let error = super::super::cohere::chat_completions_streaming(
+            post(&reqwest::Client::new(), &url),
+            &mut handler,
+            &crate::client::Model::new("cohere", "command-test"),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        for expected in [
+            "message-end",
+            "ERROR",
+            "cohere-error-123",
+            "inference worker terminated",
+            "output_tokens",
+        ] {
+            assert!(error.contains(expected), "{error} missing {expected}");
+        }
+        assert!(!error.contains("cohere-test-secret"), "{error}");
+        assert!(error.contains("[REDACTED]"), "{error}");
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cohere_message_end_timeout_is_an_error_and_never_replays() {
+        let body = concat!(
+            "event: message-end\n",
+            "data: {\"type\":\"message-end\",\"delta\":{\"finish_reason\":\"TIMEOUT\",\"usage\":{\"tokens\":{\"output_tokens\":12}}},\"request_id\":\"cohere-timeout-456\",\"details\":{\"message\":\"generation deadline exceeded\"}}\n\n"
+        );
+        let (url, requests, server) = spawn_server(vec![MockResponse::sse(body)]).await;
+        let (mut handler, _rx) = test_stream_handler();
+        let error = super::super::cohere::chat_completions_streaming(
+            post(&reqwest::Client::new(), &url),
+            &mut handler,
+            &crate::client::Model::new("cohere", "command-test"),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        for expected in [
+            "message-end",
+            "TIMEOUT",
+            "cohere-timeout-456",
+            "generation deadline exceeded",
+            "output_tokens",
+        ] {
+            assert!(error.contains(expected), "{error} missing {expected}");
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cohere_message_end_complete_preserves_content_and_tool_calls() {
+        let body = concat!(
+            "event: content-delta\n",
+            "data: {\"type\":\"content-delta\",\"delta\":{\"message\":{\"content\":{\"text\":\"answer\"}}}}\n\n",
+            "event: tool-plan-delta\n",
+            "data: {\"type\":\"tool-plan-delta\",\"delta\":{\"message\":{\"tool_plan\":\"checking the result\"}}}\n\n",
+            "event: tool-call-start\n",
+            "data: {\"type\":\"tool-call-start\",\"delta\":{\"message\":{\"tool_calls\":{\"id\":\"call-1\",\"function\":{\"name\":\"lookup\"}}}}}\n\n",
+            "event: tool-call-delta\n",
+            "data: {\"type\":\"tool-call-delta\",\"delta\":{\"message\":{\"tool_calls\":{\"function\":{\"arguments\":\"{\\\"query\\\":\\\"rust\\\"}\"}}}}}\n\n",
+            "event: tool-call-end\n",
+            "data: {\"type\":\"tool-call-end\"}\n\n",
+            "event: message-end\n",
+            "data: {\"type\":\"message-end\",\"delta\":{\"finish_reason\":\"COMPLETE\",\"usage\":{\"billed_units\":{\"output_tokens\":5}}}}\n\n"
+        );
+        let (url, requests, server) = spawn_server(vec![MockResponse::sse(body)]).await;
+        let (mut handler, _rx) = test_stream_handler();
+        super::super::cohere::chat_completions_streaming(
+            post(&reqwest::Client::new(), &url),
+            &mut handler,
+            &crate::client::Model::new("cohere", "command-test"),
+        )
+        .await
+        .unwrap();
+
+        let (text, calls) = handler.take();
+        assert!(text.contains("answer"), "{text}");
+        assert!(text.contains("checking the result"), "{text}");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "lookup");
+        assert_eq!(calls[0].arguments, json!({"query": "rust"}));
         assert_eq!(requests.load(Ordering::SeqCst), 1);
         server.await.unwrap();
     }

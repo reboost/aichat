@@ -185,11 +185,7 @@ pub async fn gemini_chat_completions(
     _model: &Model,
 ) -> Result<ChatCompletionsOutput> {
     let res = send_with_retry(builder).await?;
-    let status = res.status();
     let data: Value = res.json().await?;
-    if !status.is_success() {
-        catch_error(&data, status.as_u16())?;
-    }
     debug!("non-stream-data: {data}");
     gemini_extract_chat_completions_text(&data)
 }
@@ -200,14 +196,12 @@ pub async fn gemini_chat_completions_streaming(
     _model: &Model,
 ) -> Result<()> {
     let res = send_with_retry(builder).await?;
-    let status = res.status();
-    if !status.is_success() {
-        let data: Value = res.json().await?;
-        catch_error(&data, status.as_u16())?;
-    } else {
-        let handle = |value: &str| -> Result<()> {
+    let handle = |value: &str| -> Result<()> {
             let data: Value = serde_json::from_str(value)?;
             debug!("stream-data: {data}");
+            if data.get("error").is_some_and(Value::is_object) {
+                bail!("{}", super::retry::format_stream_error("error", value));
+            }
             if let Some(parts) = data["candidates"][0]["content"]["parts"].as_array() {
                 for (i, part) in parts.iter().enumerate() {
                     if let Some(text) = part["text"].as_str() {
@@ -229,8 +223,7 @@ pub async fn gemini_chat_completions_streaming(
 
             Ok(())
         };
-        json_stream(res.bytes_stream(), handle).await?;
-    }
+    json_stream(res.bytes_stream(), handle).await?;
     Ok(())
 }
 
@@ -268,11 +261,7 @@ fn gemini_function_call_part(call: &ToolCall) -> Value {
 
 async fn embeddings(builder: RequestBuilder, _model: &Model) -> Result<EmbeddingsOutput> {
     let res = send_with_retry(builder).await?;
-    let status = res.status();
     let data: Value = res.json().await?;
-    if !status.is_success() {
-        catch_error(&data, status.as_u16())?;
-    }
     let res_body: EmbeddingsResBody =
         serde_json::from_value(data).context("Invalid embeddings data")?;
     let output = res_body

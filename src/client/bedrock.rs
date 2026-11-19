@@ -178,12 +178,7 @@ impl Client for BedrockClient {
 
 async fn chat_completions(builder: RequestBuilder) -> Result<ChatCompletionsOutput> {
     let res = send_with_retry(builder).await?;
-    let status = res.status();
     let data: Value = res.json().await?;
-
-    if !status.is_success() {
-        catch_error(&data, status.as_u16())?;
-    }
 
     debug!("non-stream-data: {data}");
     extract_chat_completions(&data)
@@ -194,12 +189,6 @@ async fn chat_completions_streaming(
     handler: &mut SseHandler,
 ) -> Result<()> {
     let res = send_with_retry(builder).await?;
-    let status = res.status();
-    if !status.is_success() {
-        let data: Value = res.json().await?;
-        catch_error(&data, status.as_u16())?;
-        bail!("Invalid response data: {data}");
-    }
 
     let mut function_name = String::new();
     let mut function_arguments = String::new();
@@ -288,7 +277,10 @@ async fn chat_completions_streaming(
                     let payload = base64_decode(message.payload())?;
                     let data = String::from_utf8_lossy(&payload);
 
-                    bail!("Invalid response data: {data} (smithy_type: {smithy_type})")
+                    bail!(
+                        "{}",
+                        super::retry::format_stream_error(smithy_type, &data)
+                    )
                 }
                 _ => {
                     bail!("Unrecognized message, message_type: {message_type}, smithy_type: {smithy_type}",);
@@ -301,12 +293,7 @@ async fn chat_completions_streaming(
 
 async fn embeddings(builder: RequestBuilder) -> Result<EmbeddingsOutput> {
     let res = send_with_retry(builder).await?;
-    let status = res.status();
     let data: Value = res.json().await?;
-
-    if !status.is_success() {
-        catch_error(&data, status.as_u16())?;
-    }
 
     let res_body: EmbeddingsResBody =
         serde_json::from_value(data).context("Invalid embeddings data")?;
