@@ -1912,6 +1912,7 @@ mod tests {
         server.await.unwrap();
     }
 
+
     fn test_stream_handler() -> (
         crate::client::SseHandler,
         tokio::sync::mpsc::UnboundedReceiver<crate::client::SseEvent>,
@@ -1927,9 +1928,9 @@ mod tests {
     async fn anthropic_stream_error_preserves_details_redacts_secrets_and_never_replays() {
         let body = concat!(
             "event: content_block_delta\n",
-            "data: {\\"type\\":\\"content_block_delta\\",\\"delta\\":{\\"text\\":\\"partial output\\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"partial output\"}}\n\n",
             "event: error\n",
-            "data: {\\"type\\":\\"error\\",\\"error\\":{\\"type\\":\\"overloaded_error\\",\\"message\\":\\"Claude is overloaded\\",\\"request_id\\":\\"req-claude-123\\",\\"provider_detail\\":\\"upstream capacity exhausted\\",\\"api_key\\":\\"anthropic-test-secret\\"}}\n\n"
+            "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Claude is overloaded\",\"request_id\":\"req-claude-123\",\"provider_detail\":\"upstream capacity exhausted\",\"api_key\":\"anthropic-test-secret\"}}\n\n"
         );
         let (url, requests, server) = spawn_server(vec![MockResponse::sse(body)]).await;
         let (mut handler, _rx) = test_stream_handler();
@@ -1961,17 +1962,17 @@ mod tests {
     async fn anthropic_normal_content_reasoning_and_tool_events_are_preserved() {
         let body = concat!(
             "event: content_block_delta\n",
-            "data: {\\"type\\":\\"content_block_delta\\",\\"delta\\":{\\"thinking\\":\\"checking the result\\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"thinking\":\"checking the result\"}}\n\n",
             "event: content_block_stop\n",
-            "data: {\\"type\\":\\"content_block_stop\\"}\n\n",
+            "data: {\"type\":\"content_block_stop\"}\n\n",
             "event: content_block_delta\n",
-            "data: {\\"type\\":\\"content_block_delta\\",\\"delta\\":{\\"text\\":\\"answer\\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"answer\"}}\n\n",
             "event: content_block_start\n",
-            "data: {\\"type\\":\\"content_block_start\\",\\"content_block\\":{\\"type\\":\\"tool_use\\",\\"name\\":\\"lookup\\",\\"id\\":\\"tool-1\\"}}\n\n",
+            "data: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"tool_use\",\"name\":\"lookup\",\"id\":\"tool-1\"}}\n\n",
             "event: content_block_delta\n",
-            "data: {\\"type\\":\\"content_block_delta\\",\\"delta\\":{\\"partial_json\\":\\"{\\\\\\"query\\\\\\\":\\\\\\"rust\\\\\\"}\\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"partial_json\":\"{\\\"query\\\":\\\"rust\\\"}\"}}\n\n",
             "event: content_block_stop\n",
-            "data: {\\"type\\":\\"content_block_stop\\"}\n\n"
+            "data: {\"type\":\"content_block_stop\"}\n\n"
         );
         let (url, requests, server) = spawn_server(vec![MockResponse::sse(body)]).await;
         let (mut handler, _rx) = test_stream_handler();
@@ -1996,7 +1997,7 @@ mod tests {
     #[tokio::test]
     async fn openai_stream_error_envelope_preserves_details_redacts_secrets_and_never_replays() {
         let body = concat!(
-            "data: {\\"error\\":{\\"type\\":\\"rate_limit_error\\",\\"code\\":\\"rate_limit_exceeded\\",\\"message\\":\\"OpenAI stream rate limited\\",\\"request_id\\":\\"req-openai-456\\",\\"api_key\\":\\"openai-test-secret\\"}}\n\n"
+            "data: {\"error\":{\"type\":\"rate_limit_error\",\"code\":\"rate_limit_exceeded\",\"message\":\"OpenAI stream rate limited\",\"request_id\":\"req-openai-456\",\"api_key\":\"openai-test-secret\"}}\n\n"
         );
         let (url, requests, server) = spawn_server(vec![MockResponse::sse(body)]).await;
         let (mut handler, _rx) = test_stream_handler();
@@ -2026,9 +2027,9 @@ mod tests {
     #[tokio::test]
     async fn openai_normal_content_reasoning_and_tool_events_are_preserved() {
         let body = concat!(
-            "data: {\\"choices\\":[{\\"delta\\":{\\"reasoning_content\\":\\"planning\\"}}]}\n\n",
-            "data: {\\"choices\\":[{\\"delta\\":{\\"content\\":\\"answer\\"}}]}\n\n",
-            "data: {\\"choices\\":[{\\"delta\\":{\\"tool_calls\\":[{\\"index\\":0,\\"id\\":\\"call-1\\",\\"type\\":\\"function\\",\\"function\\":{\\"name\\":\\"lookup\\",\\"arguments\\":\\"{\\\\\\"query\\\\\\\":\\\\\\"rust\\\\\\"}\\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"planning\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"query\\\":\\\"rust\\\"}\"}}]}}]}\n\n",
             "data: [DONE]\n\n"
         );
         let (url, requests, server) = spawn_server(vec![MockResponse::sse(body)]).await;
