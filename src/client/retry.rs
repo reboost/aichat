@@ -309,7 +309,7 @@ fn structured_retry_hint(body: &[u8]) -> StructuredRetryHint {
                 }
 
                 for (key, value) in object {
-                    let key = key.to_ascii_lowercase().replace('_', "").replace('-', "");
+                    let key = key.to_ascii_lowercase().replace(['_', '-'], "");
                     if key == "retryinfo" {
                         hint.explicit = true;
                     } else if matches!(key.as_str(), "retrydelay" | "retryafter") {
@@ -688,16 +688,12 @@ fn redact_assignment_values(input: &str) -> String {
             .copied()
             .filter(|quote| matches!(*quote, b'"' | b'\''));
         let value_end = if let Some(quote) = quote {
-            value[value_start..]
-                .as_bytes()
-                .iter()
+            value.as_bytes()[value_start..].iter()
                 .position(|byte| *byte == quote)
                 .map(|offset| value_start + offset)
                 .unwrap_or(value.len())
         } else {
-            value[value_start..]
-                .as_bytes()
-                .iter()
+            value.as_bytes()[value_start..].iter()
                 .position(|byte| {
                     byte.is_ascii_whitespace()
                         || matches!(*byte, b',' | b';' | b'&' | b'}' | b']')
@@ -735,9 +731,7 @@ fn redact_auth_scheme(input: &str, scheme: &str) -> String {
         while token_start < value.len() && value.as_bytes()[token_start].is_ascii_whitespace() {
             token_start += 1;
         }
-        let token_end = value[token_start..]
-            .as_bytes()
-            .iter()
+        let token_end = value.as_bytes()[token_start..].iter()
             .position(|byte| {
                 byte.is_ascii_whitespace()
                     || matches!(*byte, b'"' | b'\'' | b',' | b';' | b'}' | b']')
@@ -763,9 +757,7 @@ fn redact_prefixed_token(input: &str, prefix: &str) -> String {
             break;
         };
         let start = cursor + offset;
-        let token_end = value[start..]
-            .as_bytes()
-            .iter()
+        let token_end = value.as_bytes()[start..].iter()
             .position(|byte| {
                 !(byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b'_' | b'.'))
             })
