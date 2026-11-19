@@ -319,7 +319,7 @@ fn parse_google_duration(value: &str) -> Option<Duration> {
     if seconds == 315_576_000_000 && nanos > 0 {
         return None;
     }
-    Duration::from_secs(seconds).checked_add(Duration::from_nanos(nanos))
+    Duration::from_secs(seconds).checked_add(Duration::from_nanos(u64::from(nanos)))
 }
 
 fn google_error_details(data: &Value) -> Vec<&Value> {
