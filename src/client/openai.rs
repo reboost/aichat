@@ -87,11 +87,7 @@ pub async fn openai_chat_completions(
     _model: &Model,
 ) -> Result<ChatCompletionsOutput> {
     let res = send_with_retry(builder).await?;
-    let status = res.status();
     let data: Value = res.json().await?;
-    if !status.is_success() {
-        catch_error(&data, status.as_u16())?;
-    }
 
     debug!("non-stream-data: {data}");
     openai_extract_chat_completions(&data)
@@ -215,11 +211,7 @@ pub async fn openai_embeddings(
     _model: &Model,
 ) -> Result<EmbeddingsOutput> {
     let res = send_with_retry(builder).await?;
-    let status = res.status();
     let data: Value = res.json().await?;
-    if !status.is_success() {
-        catch_error(&data, status.as_u16())?;
-    }
     let res_body: EmbeddingsResBody =
         serde_json::from_value(data).context("Invalid embeddings data")?;
     let output = res_body.data.into_iter().map(|v| v.embedding).collect();
