@@ -1996,9 +1996,7 @@ mod tests {
 
     #[tokio::test]
     async fn openai_stream_error_envelope_preserves_details_redacts_secrets_and_never_replays() {
-        let body = concat!(
-            "data: {\"error\":{\"type\":\"rate_limit_error\",\"code\":\"rate_limit_exceeded\",\"message\":\"OpenAI stream rate limited\",\"request_id\":\"req-openai-456\",\"api_key\":\"openai-test-secret\"}}\n\n"
-        );
+        let body = "data: {\"error\":{\"type\":\"rate_limit_error\",\"code\":\"rate_limit_exceeded\",\"message\":\"OpenAI stream rate limited\",\"request_id\":\"req-openai-456\",\"api_key\":\"openai-test-secret\"}}\n\n";
         let (url, requests, server) = spawn_server(vec![MockResponse::sse(body)]).await;
         let (mut handler, _rx) = test_stream_handler();
         let error = super::super::openai::openai_chat_completions_streaming(
