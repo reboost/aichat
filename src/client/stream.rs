@@ -118,7 +118,16 @@ where
         let attempt_builder = builder
             .try_clone()
             .ok_or_else(|| anyhow!("Streaming request cannot be safely cloned for retries"))?;
-        let mut es = attempt_builder.eventsource()?;
+        let mut es = match attempt_builder.eventsource() {
+            Ok(es) => es,
+            Err(EventSourceError::Transport(err)) => {
+                return Err(retry_state.transport_error(
+                    "Streaming transport failure before a provider HTTP response was received",
+                    &err,
+                ));
+            }
+            Err(err) => return Err(retry_state.with_last_diagnostic(err.into())),
+        };
         // Disable reqwest-eventsource's automatic reconnects; all retries must pass
         // through the shared policy, and no request may be replayed after Open.
         es.set_retry_policy(Box::new(Never));
@@ -144,13 +153,15 @@ where
                 }
                 Err(EventSourceError::InvalidStatusCode(status, response)) => {
                     let headers = response.headers().clone();
-                    let body = read_response_body(response).await?;
+                    let body = read_response_body(response)
+                        .await
+                        .map_err(|error| retry_state.with_last_diagnostic(error))?;
                     retry_delay = Some(retry_state.retry_response(status, &headers, &body, true)?);
                     es.close();
                     break;
                 }
                 Err(EventSourceError::Transport(err)) if !opened && err.is_connect() => {
-                    retry_delay = Some(retry_state.retry_connection()?);
+                    retry_delay = Some(retry_state.retry_connection(&err)?);
                     es.close();
                     break;
                 }
@@ -165,16 +176,16 @@ where
                     );
                 }
                 Err(EventSourceError::Transport(err)) => {
-                    if err.is_timeout() {
-                        bail!(
-                            "Provider streaming request timed out and was not replayed because the provider may have received it"
-                        );
-                    }
-                    bail!(
-                        "Event stream transport failed; the request was not replayed to avoid duplicate provider work"
-                    );
+                    let context = if opened {
+                        "Streaming transport failed after the provider HTTP response opened; the stream was not replayed"
+                    } else if err.is_timeout() {
+                        "Streaming request timed out before a provider HTTP response was received; it was not replayed because the provider may have received it"
+                    } else {
+                        "Streaming transport failed before a provider HTTP response was received; the request was not replayed"
+                    };
+                    return Err(retry_state.transport_error(context, &err));
                 }
-                Err(err) => bail!("{err}"),
+                Err(err) => return Err(retry_state.with_last_diagnostic(err.into())),
             }
         }
 
@@ -193,7 +204,12 @@ where
         .header(reqwest::header::ACCEPT, "text/event-stream")
         .send()
         .await
-        .map_err(|err| err.without_url())?;
+        .map_err(|err| {
+            anyhow!(
+                "Streaming transport failure before a provider HTTP response was received: {}",
+                err.without_url()
+            )
+        })?;
     let status = response.status();
     if status != reqwest::StatusCode::OK {
         let body = read_response_body(response).await?;
@@ -226,12 +242,14 @@ where
             Ok(event) => event,
             Err(eventsource_stream::EventStreamError::Transport(err)) if err.is_timeout() => {
                 bail!(
-                    "Provider streaming request timed out and was not replayed because the provider may have received it"
+                    "Provider stream timed out after the HTTP response opened; the stream was not replayed: {}",
+                    err.without_url()
                 );
             }
-            Err(eventsource_stream::EventStreamError::Transport(_)) => {
+            Err(eventsource_stream::EventStreamError::Transport(err)) => {
                 bail!(
-                    "Event stream transport failed; the request was not replayed to avoid duplicate provider work"
+                    "Provider stream transport failed after the HTTP response opened; the stream was not replayed: {}",
+                    err.without_url()
                 );
             }
             Err(err) => bail!("{err}"),
