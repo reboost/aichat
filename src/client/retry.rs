@@ -275,7 +275,10 @@ async fn send_with_retry_policy(builder: RequestBuilder, policy: RetryPolicy) ->
 }
 
 pub(super) fn is_retryable_status(status: StatusCode) -> bool {
-    matches!(status.as_u16(), 408 | 425 | 429 | 500 | 502 | 503 | 504 | 529)
+    matches!(
+        status.as_u16(),
+        408 | 425 | 429 | 500 | 502 | 503 | 504 | 529
+    )
 }
 
 fn parse_retry_after_header(headers: &HeaderMap) -> Option<Duration> {
@@ -485,12 +488,7 @@ fn response_error_message(status: StatusCode, body: &ResponseBody) -> String {
             let error_type = first_string(&data, &["/error/type", "/__type", "/type"]);
             let code = first_string(
                 &data,
-                &[
-                    "/error/code",
-                    "/code",
-                    "/errors/0/code",
-                    "/errors/0/reason",
-                ],
+                &["/error/code", "/code", "/errors/0/code", "/errors/0/reason"],
             );
             let provider_status = first_string(&data, &["/error/status", "/status"]);
             let details = first_value(
@@ -601,10 +599,7 @@ fn redact_secret_text(value: &str) -> String {
     for prefix in ["sk-", "AIza", "AKIA", "xoxb-", "xoxp-", "xoxa-"] {
         value = redact_prefixed_token(&value, prefix);
     }
-    value
-        .chars()
-        .filter(|value| !value.is_control())
-        .collect()
+    value.chars().filter(|value| !value.is_control()).collect()
 }
 
 fn redact_assignment_values(input: &str) -> String {
@@ -688,15 +683,16 @@ fn redact_assignment_values(input: &str) -> String {
             .copied()
             .filter(|quote| matches!(*quote, b'"' | b'\''));
         let value_end = if let Some(quote) = quote {
-            value.as_bytes()[value_start..].iter()
+            value.as_bytes()[value_start..]
+                .iter()
                 .position(|byte| *byte == quote)
                 .map(|offset| value_start + offset)
                 .unwrap_or(value.len())
         } else {
-            value.as_bytes()[value_start..].iter()
+            value.as_bytes()[value_start..]
+                .iter()
                 .position(|byte| {
-                    byte.is_ascii_whitespace()
-                        || matches!(*byte, b',' | b';' | b'&' | b'}' | b']')
+                    byte.is_ascii_whitespace() || matches!(*byte, b',' | b';' | b'&' | b'}' | b']')
                 })
                 .map(|offset| value_start + offset)
                 .unwrap_or(value.len())
@@ -731,7 +727,8 @@ fn redact_auth_scheme(input: &str, scheme: &str) -> String {
         while token_start < value.len() && value.as_bytes()[token_start].is_ascii_whitespace() {
             token_start += 1;
         }
-        let token_end = value.as_bytes()[token_start..].iter()
+        let token_end = value.as_bytes()[token_start..]
+            .iter()
             .position(|byte| {
                 byte.is_ascii_whitespace()
                     || matches!(*byte, b'"' | b'\'' | b',' | b';' | b'}' | b']')
@@ -757,10 +754,9 @@ fn redact_prefixed_token(input: &str, prefix: &str) -> String {
             break;
         };
         let start = cursor + offset;
-        let token_end = value.as_bytes()[start..].iter()
-            .position(|byte| {
-                !(byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b'_' | b'.'))
-            })
+        let token_end = value.as_bytes()[start..]
+            .iter()
+            .position(|byte| !(byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b'_' | b'.')))
             .map(|offset| start + offset)
             .unwrap_or(value.len());
         let boundary = start == 0 || !value.as_bytes()[start - 1].is_ascii_alphanumeric();
@@ -959,7 +955,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn formats_provider_error_shapes_and_preserves_unknown_bodies() {
         let cases = [
@@ -1038,12 +1033,9 @@ mod tests {
         ])
         .await;
         let started = Instant::now();
-        let response = send_with_retry_policy(
-            post(&reqwest::Client::new(), &url),
-            quick_policy(3),
-        )
-        .await
-        .unwrap();
+        let response = send_with_retry_policy(post(&reqwest::Client::new(), &url), quick_policy(3))
+            .await
+            .unwrap();
 
         assert!(response.status().is_success());
         assert!(started.elapsed() >= Duration::from_millis(70));
@@ -1059,13 +1051,10 @@ mod tests {
             MockResponse::json(503, body),
         ])
         .await;
-        let error = send_with_retry_policy(
-            post(&reqwest::Client::new(), &url),
-            quick_policy(2),
-        )
-        .await
-        .unwrap_err()
-        .to_string();
+        let error = send_with_retry_policy(post(&reqwest::Client::new(), &url), quick_policy(2))
+            .await
+            .unwrap_err()
+            .to_string();
 
         assert!(error.contains("HTTP 503"), "{error}");
         assert!(error.contains("Provider cluster overloaded"), "{error}");
@@ -1079,20 +1068,23 @@ mod tests {
 
     #[tokio::test]
     async fn bounds_unrecognized_response_body_size() {
-        let body = format!("proxy response: {}", "x".repeat(MAX_ERROR_RESPONSE_BYTES + 1_024));
-        let (url, requests, server) =
-            spawn_server(vec![MockResponse::json(400, &body)]).await;
-        let error = send_with_retry_policy(
-            post(&reqwest::Client::new(), &url),
-            quick_policy(3),
-        )
-        .await
-        .unwrap_err()
-        .to_string();
+        let body = format!(
+            "proxy response: {}",
+            "x".repeat(MAX_ERROR_RESPONSE_BYTES + 1_024)
+        );
+        let (url, requests, server) = spawn_server(vec![MockResponse::json(400, &body)]).await;
+        let error = send_with_retry_policy(post(&reqwest::Client::new(), &url), quick_policy(3))
+            .await
+            .unwrap_err()
+            .to_string();
 
         assert!(error.contains("HTTP 400"), "{error}");
         assert!(error.contains("response body truncated"), "{error}");
-        assert!(error.len() <= MAX_ERROR_RESPONSE_BYTES + 256, "{}", error.len());
+        assert!(
+            error.len() <= MAX_ERROR_RESPONSE_BYTES + 256,
+            "{}",
+            error.len()
+        );
         assert_eq!(requests.load(Ordering::SeqCst), 1);
         server.await.unwrap();
     }
@@ -1273,7 +1265,10 @@ mod tests {
 
         let mut headers = HeaderMap::new();
         headers.insert(RETRY_AFTER, "2".parse().unwrap());
-        assert_eq!(parse_retry_after_header(&headers), Some(Duration::from_secs(2)));
+        assert_eq!(
+            parse_retry_after_header(&headers),
+            Some(Duration::from_secs(2))
+        );
         let date = (Utc::now() + chrono::Duration::seconds(2))
             .format("%a, %d %b %Y %H:%M:%S GMT")
             .to_string();
