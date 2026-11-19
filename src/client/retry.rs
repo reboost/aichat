@@ -284,7 +284,7 @@ fn structured_retry_hint(body: &[u8]) -> StructuredRetryHint {
                 }
 
                 for (key, value) in object {
-                    let key = key.to_ascii_lowercase().replace(['_', '-'], "");
+                    let key = key.to_ascii_lowercase().replace('_', "").replace('-', "");
                     if key == "retryinfo" {
                         hint.explicit = true;
                     } else if matches!(key.as_str(), "retrydelay" | "retryafter") {
@@ -391,10 +391,14 @@ fn permanent_failure(body: &[u8], has_retry_hint: bool) -> Option<&'static str> 
         "quota exhausted",
         "no remaining quota",
         "out of quota",
-        "daily quota",
-        "monthly quota",
-        "per-day quota",
-        "per-month quota",
+        "daily quota exhausted",
+        "monthly quota exhausted",
+        "daily quota limit exceeded",
+        "monthly quota limit exceeded",
+        "daily limit reached",
+        "monthly limit reached",
+        "per-day quota exhausted",
+        "per-month quota exhausted",
     ]
     .iter()
     .any(|value| text.contains(value));
@@ -410,6 +414,10 @@ fn permanent_failure(body: &[u8], has_retry_hint: bool) -> Option<&'static str> 
         "quota_exceeded",
         "quota exceeded",
         "quota has been exceeded",
+        "daily quota",
+        "monthly quota",
+        "daily limit",
+        "monthly limit",
     ]
     .iter()
     .any(|value| text.contains(value));
@@ -422,7 +430,7 @@ fn permanent_failure(body: &[u8], has_retry_hint: bool) -> Option<&'static str> 
 }
 
 fn response_error_message(status: StatusCode, body: &ResponseBody) -> String {
-    let body_text = response_body_text(body);
+    let body_text = redact_secret_text(&String::from_utf8_lossy(&body.bytes));
     let mut diagnostic = match serde_json::from_slice::<Value>(&body.bytes) {
         Ok(mut data) => {
             redact_json_secrets(&mut data);
@@ -440,16 +448,14 @@ fn response_error_message(status: StatusCode, body: &ResponseBody) -> String {
                     "/title",
                 ],
             );
+            let error_type = first_string(&data, &["/error/type", "/__type", "/type"]);
             let code = first_string(
                 &data,
                 &[
-                    "/error/type",
                     "/error/code",
                     "/error/status",
                     "/code",
                     "/status",
-                    "/__type",
-                    "/type",
                     "/errors/0/code",
                     "/errors/0/reason",
                 ],
@@ -468,6 +474,9 @@ fn response_error_message(status: StatusCode, body: &ResponseBody) -> String {
             let mut parts = Vec::new();
             if let Some(message) = message {
                 parts.push(message);
+            }
+            if let Some(error_type) = error_type {
+                parts.push(format!("type: {error_type}"));
             }
             if let Some(code) = code {
                 parts.push(format!("code: {code}"));
@@ -554,9 +563,9 @@ fn redact_json_secrets(value: &mut Value) {
 }
 
 fn redact_secret_text(value: &str) -> String {
-    let mut value = redact_assignment_values(value);
-    value = redact_auth_scheme(&value, "bearer");
+    let mut value = redact_auth_scheme(value, "bearer");
     value = redact_auth_scheme(&value, "basic");
+    value = redact_assignment_values(&value);
     for prefix in ["sk-", "AIza", "AKIA", "xoxb-", "xoxp-", "xoxa-"] {
         value = redact_prefixed_token(&value, prefix);
     }
@@ -897,6 +906,144 @@ mod tests {
         }
     }
 
+
+    #[test]
+    fn formats_provider_error_shapes_and_preserves_unknown_bodies() {
+        let cases = [
+            (
+                br#"{"error":{"type":"invalid_request_error","code":"model_not_found","message":"Unknown model"}}"#.as_slice(),
+                &["HTTP 429", "Unknown model", "invalid_request_error", "model_not_found"][..],
+            ),
+            (
+                br#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#.as_slice(),
+                &["HTTP 429", "Overloaded", "overloaded_error"][..],
+            ),
+            (
+                br#"{"message":"Rate limit reached","code":"rate_limit_exceeded"}"#.as_slice(),
+                &["HTTP 429", "Rate limit reached", "rate_limit_exceeded"][..],
+            ),
+            (
+                br#"{"message":"Request throttled","__type":"ThrottlingException"}"#.as_slice(),
+                &["HTTP 429", "Request throttled", "ThrottlingException"][..],
+            ),
+            (
+                br#"{"error":{"code":429,"message":"Quota exceeded","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"2s"}]}}"#.as_slice(),
+                &["HTTP 429", "Quota exceeded", "RESOURCE_EXHAUSTED", "RetryInfo", "retryDelay"][..],
+            ),
+        ];
+
+        for (bytes, expected) in cases {
+            let body = ResponseBody {
+                bytes: bytes.to_vec(),
+                truncated: false,
+            };
+            let diagnostic = format_response_error(StatusCode::TOO_MANY_REQUESTS, &body);
+            for value in expected {
+                assert!(diagnostic.contains(value), "{diagnostic} missing {value}");
+            }
+        }
+
+        let raw = b"upstream proxy rejected request: gateway said unavailable";
+        let body = ResponseBody {
+            bytes: raw.to_vec(),
+            truncated: false,
+        };
+        let diagnostic = format_response_error(StatusCode::BAD_GATEWAY, &body);
+        assert!(diagnostic.contains("HTTP 502"));
+        assert!(diagnostic.contains("gateway said unavailable"));
+    }
+
+    #[test]
+    fn redacts_credentials_from_json_and_unparsed_error_bodies() {
+        let json_body = ResponseBody {
+            bytes: br#"{"service":{"api_key":"json-secret-key","refresh_token":"refresh-secret","note":"Authorization: Bearer header-secret"}}"#.to_vec(),
+            truncated: false,
+        };
+        let diagnostic = format_response_error(StatusCode::BAD_REQUEST, &json_body);
+        for secret in ["json-secret-key", "refresh-secret", "header-secret"] {
+            assert!(!diagnostic.contains(secret), "{diagnostic}");
+        }
+        assert!(diagnostic.contains("[REDACTED]"));
+
+        let raw_body = ResponseBody {
+            bytes: b"upstream echoed Authorization: Bearer plain-secret-token and api_key=other-secret"
+                .to_vec(),
+            truncated: false,
+        };
+        let diagnostic = format_response_error(StatusCode::BAD_GATEWAY, &raw_body);
+        for secret in ["plain-secret-token", "other-secret"] {
+            assert!(!diagnostic.contains(secret), "{diagnostic}");
+        }
+    }
+
+    #[tokio::test]
+    async fn retries_gemini_quota_error_with_nested_google_retry_info() {
+        let body = r#"{"error":{"code":429,"message":"Quota exceeded for this request","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"0.08s"}]}}"#;
+        let (url, requests, server) = spawn_server(vec![
+            MockResponse::json(429, body),
+            MockResponse::json(200, r#"{"ok":true}"#),
+        ])
+        .await;
+        let started = Instant::now();
+        let response = send_with_retry_policy(
+            post(&reqwest::Client::new(), &url),
+            quick_policy(3),
+        )
+        .await
+        .unwrap();
+
+        assert!(response.status().is_success());
+        assert!(started.elapsed() >= Duration::from_millis(70));
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn preserves_provider_diagnostic_when_retry_attempts_are_exhausted() {
+        let body = r#"{"error":{"type":"overloaded_error","code":"UPSTREAM_BUSY","message":"Provider cluster overloaded; capacity unavailable"}}"#;
+        let (url, requests, server) = spawn_server(vec![
+            MockResponse::json(503, body),
+            MockResponse::json(503, body),
+        ])
+        .await;
+        let error = send_with_retry_policy(
+            post(&reqwest::Client::new(), &url),
+            quick_policy(2),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("HTTP 503"), "{error}");
+        assert!(error.contains("Provider cluster overloaded"), "{error}");
+        assert!(error.contains("overloaded_error"), "{error}");
+        assert!(error.contains("UPSTREAM_BUSY"), "{error}");
+        assert!(error.contains("2 attempts"), "{error}");
+        assert!(!error.contains("provider request failed"), "{error}");
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bounds_unrecognized_response_body_size() {
+        let body = format!("proxy response: {}", "x".repeat(MAX_ERROR_RESPONSE_BYTES + 1_024));
+        let (url, requests, server) =
+            spawn_server(vec![MockResponse::json(400, &body)]).await;
+        let error = send_with_retry_policy(
+            post(&reqwest::Client::new(), &url),
+            quick_policy(3),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("HTTP 400"), "{error}");
+        assert!(error.contains("response body truncated"), "{error}");
+        assert!(error.len() <= MAX_ERROR_RESPONSE_BYTES + 256, "{}", error.len());
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        server.await.unwrap();
+    }
+
     #[tokio::test]
     async fn retries_429_and_respects_retry_after() {
         let (url, requests, server) = spawn_server(vec![
@@ -1073,12 +1220,18 @@ mod tests {
 
         let mut headers = HeaderMap::new();
         headers.insert(RETRY_AFTER, "2".parse().unwrap());
-        assert_eq!(parse_retry_after(&headers), Some(Duration::from_secs(2)));
+        assert_eq!(parse_retry_after_header(&headers), Some(Duration::from_secs(2)));
         let date = (Utc::now() + chrono::Duration::seconds(2))
             .format("%a, %d %b %Y %H:%M:%S GMT")
             .to_string();
         headers.insert(RETRY_AFTER, date.parse().unwrap());
-        assert!(parse_retry_after(&headers).unwrap() >= Duration::from_secs(1));
+        assert!(parse_retry_after_header(&headers).unwrap() >= Duration::from_secs(1));
+
+        let hint = structured_retry_hint(
+            br#"{"error":{"details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"1.5s"}]}}"#,
+        );
+        assert!(hint.explicit);
+        assert_eq!(hint.delay, Some(Duration::from_millis(1500)));
     }
 
     #[tokio::test]

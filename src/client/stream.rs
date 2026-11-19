@@ -1,6 +1,5 @@
 use super::retry::{
-    format_response_error, read_response_body, response_body_text, is_retryable_status,
-    RetryPolicy, RetryState,
+    format_response_error, read_response_body, response_body_text, RetryPolicy, RetryState,
 };
 use super::ToolCall;
 use crate::utils::AbortSignal;
