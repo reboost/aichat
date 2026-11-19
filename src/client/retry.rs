@@ -357,7 +357,11 @@ fn retry_delay(headers: &HeaderMap, body: &[u8]) -> Result<Option<Duration>, &'s
     Ok(header_delay.into_iter().chain(google_delay).max())
 }
 
-fn google_has_long_window_quota(data: &Value) -> bool {
+fn google_has_daily_quota(data: &Value) -> bool {
+    const DAILY_QUOTA_IDS: &[&str] = &[
+        "GenerateRequestsPerDayPerProjectPerModel-FreeTier",
+        "GenerateContentInputTokensPerModelPerDay-FreeTier",
+    ];
     // Gemini quota failures expose quota IDs such as GenerateRequestsPerDayPerProjectPerModel-FreeTier.
     let details = data
         .pointer("/error/details")
@@ -375,10 +379,7 @@ fn google_has_long_window_quota(data: &Value) -> bool {
             .into_iter()
             .flatten()
             .filter_map(|violation| violation.get("quotaId").and_then(Value::as_str))
-            .any(|quota_id| {
-                let quota_id = quota_id.to_ascii_lowercase();
-                quota_id.contains("perday") || quota_id.contains("permonth")
-            })
+            .any(|quota_id| DAILY_QUOTA_IDS.contains(&quota_id))
     })
 }
 
@@ -422,8 +423,8 @@ fn permanent_failure(status: StatusCode, body: &[u8]) -> Option<&'static str> {
     if has_code(AUTH_CODES) {
         return Some("The provider rejected the request credentials; check the authentication configuration");
     }
-    if google_has_long_window_quota(&data) {
-        return Some("Google reports a daily or monthly quota violation; retrying within the configured window is unlikely to help");
+    if google_has_daily_quota(&data) {
+        return Some("Google reports a documented daily quota violation; retrying within the configured window is unlikely to help");
     }
     None
 }
@@ -1220,8 +1221,6 @@ mod tests {
 
         let google_daily = br#"{"error":{"details":[{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{"quotaId":"GenerateRequestsPerDayPerProjectPerModel-FreeTier"}]},{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"59s"}]}}"#;
         assert!(permanent_failure(StatusCode::TOO_MANY_REQUESTS, google_daily).is_some());
-        let google_monthly = br#"{"error":{"details":[{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{"quotaId":"GenerateRequestsPerMonthPerProject"}]}]}}"#;
-        assert!(permanent_failure(StatusCode::TOO_MANY_REQUESTS, google_monthly).is_some());
         let google_minute = br#"{"error":{"details":[{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{"quotaId":"GenerateRequestsPerMinutePerProjectPerModel-FreeTier"}]}]}}"#;
         assert!(permanent_failure(StatusCode::TOO_MANY_REQUESTS, google_minute).is_none());
 
