@@ -271,7 +271,7 @@ async fn send_with_retry_policy(builder: RequestBuilder, policy: RetryPolicy) ->
 }
 
 pub(super) fn is_retryable_status(status: StatusCode) -> bool {
-    matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504 | 529)
+    matches!(status.as_u16(), 408 | 425 | 429 | 500 | 502 | 503 | 504 | 529)
 }
 
 fn parse_retry_after_header(headers: &HeaderMap) -> Option<Duration> {
@@ -631,6 +631,9 @@ fn redact_assignment_values(input: &str) -> String {
                 lower[cursor..]
                     .find(marker)
                     .map(|offset| (cursor + offset, *marker))
+            })
+            .filter(|(index, _)| {
+                *index == 0 || !lower.as_bytes()[index - 1].is_ascii_alphanumeric()
             })
             .min_by_key(|(index, _)| *index);
         let Some((start, marker)) = found else {
@@ -1135,7 +1138,7 @@ mod tests {
 
     #[tokio::test]
     async fn retries_server_errors_and_anthropic_overload() {
-        for status in [500, 502, 503, 504, 529] {
+        for status in [408, 425, 500, 502, 503, 504, 529] {
             let (url, requests, server) = spawn_server(vec![
                 MockResponse::json(
                     status,
