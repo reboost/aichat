@@ -384,6 +384,7 @@ fn contains_text_retry_hint(body: &[u8]) -> bool {
 
 fn permanent_failure(body: &[u8], has_retry_hint: bool) -> Option<&'static str> {
     let text = String::from_utf8_lossy(body).to_ascii_lowercase();
+    let has_retry_hint = has_retry_hint || contains_text_retry_hint(body);
 
     let permanent = [
         "insufficient_quota",
