@@ -144,7 +144,7 @@ where
                 Err(EventSourceError::InvalidStatusCode(status, response)) => {
                     let headers = response.headers().clone();
                     let body = response.text().await?;
-                    if can_retry && is_retryable_status(status) {
+                    if is_retryable_status(status) {
                         retry_delay =
                             Some(retry_state.retry_response(status, &headers, body.as_bytes())?);
                     } else {
@@ -163,7 +163,7 @@ where
                     break;
                 }
                 Err(EventSourceError::Transport(err))
-                    if can_retry && !opened && err.is_connect() =>
+                    if !opened && err.is_connect() =>
                 {
                     retry_delay = Some(retry_state.retry_connection()?);
                     es.close();
