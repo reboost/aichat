@@ -101,7 +101,7 @@ where
 
 pub(super) async fn sse_stream_with_policy<F>(
     builder: RequestBuilder,
-    handle: F,
+    mut handle: F,
     policy: RetryPolicy,
 ) -> Result<()>
 where
