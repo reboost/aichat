@@ -1912,7 +1912,6 @@ mod tests {
         server.await.unwrap();
     }
 
-
     fn test_stream_handler() -> (
         crate::client::SseHandler,
         tokio::sync::mpsc::UnboundedReceiver<crate::client::SseEvent>,
@@ -1985,7 +1984,10 @@ mod tests {
         .unwrap();
 
         let (text, calls) = handler.take();
-        assert!(text.contains("<think>\nchecking the result\n</think>"), "{text}");
+        assert!(
+            text.contains("<think>\nchecking the result\n</think>"),
+            "{text}"
+        );
         assert!(text.contains("answer"), "{text}");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "lookup");
@@ -2096,5 +2098,4 @@ mod tests {
         assert!(!error.contains("bedrock-test-secret"), "{error}");
         assert!(error.contains("[REDACTED]"), "{error}");
     }
-
 }
